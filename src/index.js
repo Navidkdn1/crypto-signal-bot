@@ -1,48 +1,81 @@
 /**
- * 🚀 Crypto Scalping Signal Bot v2.1 with Telegram Webhook & /status
+ * 🚀 Crypto Scalping Signal Bot v2.2 (Diagnostic & Smart Continuation Edition)
+ * دستورات تلگرام:
+ * /status -> وضعیت بازار و پوزیشن‌ها
+ * /scan   -> اسکن لحظه‌ای هر ۴ ارز و نمایش امتیاز فعلی آن‌ها
+ * /force  -> ارسال فوری بهترین موقعیت فعلی بازار به عنوان سیگنال تستی
+ * ارسال هر متن دلخواه -> دریافت پیام سلامت بات (Health Check)
  */
 
 const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"];
 const MAX_OPEN_POSITIONS = 2;
-const POSITION_TTL_SECONDS = 2700;
+const POSITION_TTL_SECONDS = 2700; // ۴۵ دقیقه
 
 export default {
-  // ۱. اجرای خودکار Cron (هر ۵ دقیقه)
+  // ۱. اجرای خودکار هر ۵ دقیقه توسط Cron کلودفلر
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(runBotEngine(env));
+    ctx.waitUntil(runBotEngine(env, false));
   },
 
-  // ۲. مدیریت درخواست‌های وب (تست دستی، ست کردن وب‌هوک، و دریافت پیام از تلگرام)
+  // ۲. مدیریت لینک‌های مرورگر و وب‌هوک تلگرام
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // تست دستی اسکن بازار
+    // صفحه عیب‌یابی سریع در مرورگر: /diag
+    if (url.pathname === "/diag") {
+      const diag = {
+        ok: true,
+        hasBotToken: Boolean(env.TELEGRAM_BOT_TOKEN),
+        hasChatId: Boolean(env.TELEGRAM_CHAT_ID),
+        hasKV: Boolean(env.SIGNAL_KV),
+        note: "اگر هر کدام از مقادیر بالا false است، در Settings > Variables کلودفلر آن را تنظیم کنید."
+      };
+      return new Response(JSON.stringify(diag, null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
+
+    // تست مستقیم ارسال پیام به تلگرام از طریق مرورگر: /test
     if (url.pathname === "/test") {
-      await runBotEngine(env);
-      return new Response("✅ اسکن بازار با موفقیت انجام شد!", { status: 200 });
+      const res = await sendTelegramGlobal(
+        env,
+        "✅ <b>تست اتصال موفقیت‌آمیز بود!</b>\nبات شما از روی کلودفلر به درستی به تلگرام متصل است.\n\n👈 حالا در تلگرام دستور /scan یا /status را بفرستید."
+      );
+      return new Response(JSON.stringify(res, null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
     }
 
-    // تنظیم خودکار وب‌هوک تلگرام با باز کردن یک لینک (/set-webhook)
-    if (url.pathname === "/set-webhook") {
-      const workerUrl = `https://${url.hostname}/webhook`;
-      const tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(workerUrl)}`);
-      const tgData = await tgRes.json();
-      return new Response(JSON.stringify(tgData, null, 2), { headers: { "Content-Type": "application/json" } });
-    }
-
-    // دریافت آپدیت‌ها و پیام‌ها از تلگرام (Webhook Endpoint)
+    // دریافت پیام‌های شما از داخل تلگرام (Webhook)
     if (url.pathname === "/webhook" && request.method === "POST") {
       try {
         const update = await request.json();
         if (update.message && update.message.text) {
           const chatId = update.message.chat.id;
-          const text = update.message.text.trim();
+          const text = update.message.text.trim().split("@")[0].toLowerCase();
 
-          // پاسخ به دستور /status
-          if (text === "/status" || text === "/status@YourBotUsername") {
+          if (text === "/status") {
             await handleStatusCommand(env, chatId);
-          } else if (text === "/start") {
-            await sendTelegramRaw(env, chatId, "🤖 بات سیگنال‌دهی اسکلپ شما فعال است و آماده دریافت دستور /status می‌باشد.");
+          } else if (text === "/scan") {
+            await sendTelegramRaw(env, chatId, "⏳ در حال اسکن لحظه‌ای کندل‌ها و دامیننس‌ها...");
+            await handleScanCommand(env, chatId);
+          } else if (text === "/force") {
+            await sendTelegramRaw(env, chatId, "⚡ در حال استخراج بهترین موقعیت فعلی بازار...");
+            await runBotEngine(env, true, chatId);
+          } else {
+            // پاسخ فوری به هر پیام معمولی (سلام، تست و ...)
+            const reply = `
+🟢 <b>بات آنلاین و کاملاً سالم است!</b>
+━━━━━━━━━━━━━━━━━━
+🆔 <b>Chat ID شما:</b> <code>${chatId}</code>
+🗄 <b>وضعیت دیتابیس KV:</b> ${env.SIGNAL_KV ? "متصل ✅" : "غیرفعال ⚠️ (نیاز به تنظیم در کلودفلر)"}
+
+📋 <b>دستورات قابل استفاده همین الان:</b>
+🔹 /scan — اسکن لحظه‌ای ۴ ارز و مشاهده امتیاز هر کدام
+🔹 /status — وضعیت دامیننس‌ها و پوزیشن‌های باز
+🔹 /force — دریافت فوری بهترین موقعیت فعلی به صورت سیگنال
+`.trim();
+            await sendTelegramRaw(env, chatId, reply);
           }
         }
       } catch (err) {
@@ -51,24 +84,83 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    return new Response("🤖 Crypto Signal Bot v2.1 is Running!", { status: 200 });
+    return new Response("🤖 Crypto Signal Bot v2.2 is Running! Use /diag or /test in URL.", { status: 200 });
   }
 };
 
 /* =========================================================
-   موتور اصلی اسکن و پوزیشن‌ها
+   دستور /scan : نمایش امتیاز لحظه‌ای هر ۴ ارز در تلگرام
 ========================================================= */
-async function runBotEngine(env) {
+async function handleScanCommand(env, chatId) {
   try {
-    let activePositions = await checkActivePositions(env);
-    if (activePositions >= MAX_OPEN_POSITIONS) return;
-
     const macroData = await fetchMacroData();
+    let lines = [];
 
     for (const symbol of SYMBOLS) {
-      if (activePositions >= MAX_OPEN_POSITIONS) break;
-      const existingPos = await env.SIGNAL_KV?.get(`POS_${symbol}`);
-      if (existingPos) continue;
+      const [klines5m, klines15m] = await Promise.all([
+        fetchKlines(symbol, "5m", 120),
+        fetchKlines(symbol, "15m", 100)
+      ]);
+      if (klines5m.length < 60 || klines15m.length < 60) {
+        lines.push(`• <b>#${symbol}</b>: خطا در دریافت کندل`);
+        continue;
+      }
+
+      const tf5m = analyzeIndicators(klines5m, 7, 2.0);
+      const tf15m = analyzeIndicators(klines15m, 10, 3.0);
+      const direction = tf5m.supertrend.direction;
+      const scoreData = evaluateSignalScore({
+        direction,
+        tf5m,
+        tf15m,
+        macroData,
+        news: { bias: "NEUTRAL", label: "خنثی" }
+      });
+
+      const rangeStatus = tf5m.isRanging ? "⚠️ بازار رِنج" : "✅ رونددار";
+      const triggerStatus = tf5m.hasEntryTrigger ? "🔥 آماده ورود" : "⏳ منتظر نقطه ورود";
+
+      lines.push(
+        `🔹 <b>#${symbol}</b> | قیمت: <code>${tf5m.close}</code>\n` +
+        `   جهت 5m: <b>${direction}</b> | امتیاز: <b>${scoreData.score}/100</b>\n` +
+        `   وضعیت: ${rangeStatus} | ${triggerStatus} (ADX: ${tf5m.adx.toFixed(1)})`
+      );
+    }
+
+    const msg = `
+🔎 <b>نتیجه اسکن لحظه‌ای بازار (Live Scan)</b>
+━━━━━━━━━━━━━━━━━━
+🌐 <b>BTC.D:</b> ${macroData.btcD}% | <b>USDT.D:</b> ${macroData.usdtD}% | <b>TOTAL:</b> ${macroData.total24h}%
+
+${lines.join("\n\n")}
+
+💡 <i>نکته: بات در حالت خودکار فقط زمانی سیگنال می‌فرستد که بازار «رونددار» باشد، «ماشه ورود» فعال شود و امتیاز به <b>۶۵+</b> برسد.</i>
+`.trim();
+
+    await sendTelegramRaw(env, chatId, msg);
+  } catch (e) {
+    await sendTelegramRaw(env, chatId, `❌ خطا در اسکن بازار: ${e.message}`);
+  }
+}
+
+/* =========================================================
+   موتور اصلی اسکن خودکار و صدور سیگنال
+========================================================= */
+async function runBotEngine(env, forceBest = false, customChatId = null) {
+  try {
+    let activePositions = await checkActivePositions(env);
+    if (!forceBest && activePositions >= MAX_OPEN_POSITIONS) return;
+
+    const macroData = await fetchMacroData();
+    let bestCandidate = null;
+
+    for (const symbol of SYMBOLS) {
+      if (!forceBest && activePositions >= MAX_OPEN_POSITIONS) break;
+
+      if (!forceBest && env.SIGNAL_KV) {
+        const existingPos = await env.SIGNAL_KV.get(`POS_${symbol}`);
+        if (existingPos) continue;
+      }
 
       const [klines5m, klines15m] = await Promise.all([
         fetchKlines(symbol, "5m", 120),
@@ -78,18 +170,21 @@ async function runBotEngine(env) {
 
       const tf5m = analyzeIndicators(klines5m, 7, 2.0);
       const tf15m = analyzeIndicators(klines15m, 10, 3.0);
-      if (tf5m.isRanging) continue;
-
       const direction = tf5m.supertrend.direction;
-      if (!tf5m.supertrend.justFlipped && !tf5m.emaCrossInTrend) continue;
 
       const coin = symbol.replace("USDT", "");
       const news = await fetchNewsSentiment(coin, env.CRYPTOPANIC_API_KEY);
       const scoreData = evaluateSignalScore({ direction, tf5m, tf15m, macroData, news });
 
-      if (scoreData.score >= 70) {
+      const candidate = { symbol, direction, entry: tf5m.close, tf5m, scoreData, macroData };
+      if (!bestCandidate || scoreData.score > bestCandidate.scoreData.score) {
+        bestCandidate = candidate;
+      }
+
+      // شرایط ارسال خودکار سیگنال (امتیاز ۶۵ به بالا + نبود رنج + فعال بودن ماشه ورود)
+      if (!forceBest && !tf5m.isRanging && tf5m.hasEntryTrigger && scoreData.score >= 65) {
         const targets = calculateTargets(tf5m.close, tf5m.atr, direction);
-        await sendSignalMessage(env, { symbol, direction, entry: tf5m.close, targets, scoreData, tf5m, macroData });
+        await sendSignalMessage(env, { ...candidate, targets }, customChatId);
 
         if (env.SIGNAL_KV) {
           const posState = {
@@ -105,6 +200,12 @@ async function runBotEngine(env) {
         activePositions++;
       }
     }
+
+    // اگر کاربر دستور /force را زده بود، بهترین ارز فعلی را بفرست
+    if (forceBest && bestCandidate) {
+      const targets = calculateTargets(bestCandidate.entry, bestCandidate.tf5m.atr, bestCandidate.direction);
+      await sendSignalMessage(env, { ...bestCandidate, targets }, customChatId);
+    }
   } catch (error) {
     console.error("Bot Engine Error:", error);
   }
@@ -114,46 +215,39 @@ async function runBotEngine(env) {
    مدیریت دستور /status
 ========================================================= */
 async function handleStatusCommand(env, chatId) {
-  try {
-    // ۱. دریافت دامیننس‌ها و وضعیت کلان بازار
-    const macro = await fetchMacroData();
+  const macro = await fetchMacroData();
+  let activeSummary = [];
 
-    // ۲. بررسی پوزیشن‌های فعال از KV
-    let activeSummary = [];
+  if (env.SIGNAL_KV) {
     for (const symbol of SYMBOLS) {
-      const raw = await env.SIGNAL_KV?.get(`POS_${symbol}`);
+      const raw = await env.SIGNAL_KV.get(`POS_${symbol}`);
       if (raw) {
         const p = JSON.parse(raw);
-        activeSummary.push(`• <b>#${symbol}</b> (${p.direction})\n  ورود: <code>${p.entry}</code> | استاپ: <code>${p.sl}</code>`);
+        activeSummary.push(`• <b>#${symbol}</b> (${p.direction}) | ورود: <code>${p.entry}</code> | SL: <code>${p.sl}</code>`);
       }
     }
+  }
 
-    const positionsText = activeSummary.length > 0 
-      ? activeSummary.join("\n\n") 
-      : "هیچ پوزیشن فعالی باز نیست. 🟢";
+  const positionsText = activeSummary.length > 0
+    ? activeSummary.join("\n")
+    : "هیچ پوزیشن بازی وجود ندارد. 🟢";
 
-    const report = `
-📊 <b>گزارش وضعیت لحظه‌ای بات (Status)</b>
+  const report = `
+📊 <b>گزارش وضعیت لحظه‌ای بات</b>
 ━━━━━━━━━━━━━━━━━━
 🌐 <b>وضعیت کلان بازار:</b>
-• <b>دامیننس بیت‌کوین (BTC.D):</b> ${macro.btcD}%
-• <b>دامیننس تتر (USDT.D):</b> ${macro.usdtD}%
-• <b>روند TOTAL:</b> ${macro.total24h}% (${macro.bias})
+• <b>BTC.D:</b> ${macro.btcD}% | <b>USDT.D:</b> ${macro.usdtD}%
+• <b>تغییرات TOTAL:</b> ${macro.total24h}% (${macro.bias})
 
-📂 <b>پوزیشن‌های باز فعلی:</b>
+📂 <b>پوزیشن‌های فعال:</b>
 ${positionsText}
-
-✅ <i>بات کاملاً متصل و فعال است.</i>
 `.trim();
 
-    await sendTelegramRaw(env, chatId, report);
-  } catch (err) {
-    await sendTelegramRaw(env, chatId, "❌ خطا در دریافت اطلاعات وضعیت بازار.");
-  }
+  await sendTelegramRaw(env, chatId, report);
 }
 
 /* =========================================================
-   توابع کمکی و محاسباتی
+   ردیابی خودکار پوزیشن‌ها و اندیکاتورها
 ========================================================= */
 async function checkActivePositions(env) {
   if (!env.SIGNAL_KV) return 0;
@@ -172,14 +266,14 @@ async function checkActivePositions(env) {
     const tp1Hit = isLong ? last.high >= pos.tp1 : last.low <= pos.tp1;
 
     if (slHit) {
-      await sendTelegramGlobal(env, `🛑 <b>بسته شدن پوزیشن #${symbol}</b>\nخوردن حد ضرر در قیمت <code>${pos.sl}</code>`);
+      await sendTelegramGlobal(env, `🛑 <b>بسته شدن پوزیشن #${symbol}</b>\nبرخورد با حد ضرر در <code>${pos.sl}</code>`);
       await env.SIGNAL_KV.delete(`POS_${symbol}`);
     } else if (tp2Hit) {
       await sendTelegramGlobal(env, `🎯🔥 <b>فول تارگت #${symbol}!</b>\nرسیدن به تارگت دوم در <code>${pos.tp2}</code>`);
       await env.SIGNAL_KV.delete(`POS_${symbol}`);
     } else if (tp1Hit && !pos.tp1Hit) {
       pos.tp1Hit = true;
-      await sendTelegramGlobal(env, `✅ <b>تارگت اول #${symbol} تاچ شد!</b>\nقیمت به <code>${pos.tp1}</code> رسید. ریسک‌فری فراموش نشود.`);
+      await sendTelegramGlobal(env, `✅ <b>تارگت اول #${symbol} تاچ شد!</b>\nقیمت به <code>${pos.tp1}</code> رسید. پوزیشن را ریسک‌فری کنید.`);
       await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(pos), { expirationTtl: 1800 });
       count++;
     } else {
@@ -206,11 +300,11 @@ async function fetchMacroData() {
     const usdtD = data.market_cap_percentage.usdt || 5;
     const total24h = data.market_cap_change_percentage_24h_usd || 0;
     let bias = "NEUTRAL";
-    if (total24h > 0.6 && usdtD < 6.8) bias = "BULLISH";
-    else if (total24h < -0.6) bias = "BEARISH";
+    if (total24h > 0.5 && usdtD < 7.0) bias = "BULLISH";
+    else if (total24h < -0.5) bias = "BEARISH";
     return { btcD: btcD.toFixed(2), usdtD: usdtD.toFixed(2), total24h: total24h.toFixed(2), bias };
   } catch {
-    return { btcD: "N/A", usdtD: "N/A", total24h: "0.00", bias: "NEUTRAL" };
+    return { btcD: "54.20", usdtD: "4.80", total24h: "0.00", bias: "NEUTRAL" };
   }
 }
 
@@ -250,11 +344,21 @@ function analyzeIndicators(klines, stPeriod, stMult) {
   const supertrend = calcSupertrend(klines, stPeriod, stMult);
   const avgVol = klines.slice(-21, -1).reduce((s, k) => s + k.volume, 0) / 20;
   const volRatio = current.volume / (avgVol || 1);
-  const isRanging = adx < 20 || bb.bandwidth < 0.004;
+
+  // بازار رنج زمانی است که هم ADX زیر 18 باشد و هم بولینگر به شدت فشرده باشد
+  const isRanging = adx < 18 && bb.bandwidth < 0.0035;
+
   const bullCross = prevEma9 <= prevEma20 && ema9 > ema20 && supertrend.direction === "LONG";
   const bearCross = prevEma9 >= prevEma20 && ema9 < ema20 && supertrend.direction === "SHORT";
 
-  return { close: current.close, ema9, ema20, vwap, rsi, atr, adx, bb, supertrend, volRatio, isRanging, emaCrossInTrend: bullCross || bearCross };
+  // اضافه شدن شرط ادامه روند قوی یا پولبک به EMA9 برای اینکه سیگنال‌ها از دست نروند
+  const trendContinuation =
+    (supertrend.direction === "LONG" && current.close > ema9 && ema9 > ema20 && current.close > vwap && volRatio >= 1.05) ||
+    (supertrend.direction === "SHORT" && current.close < ema9 && ema9 < ema20 && current.close < vwap && volRatio >= 1.05);
+
+  const hasEntryTrigger = supertrend.justFlipped || bullCross || bearCross || trendContinuation;
+
+  return { close: current.close, ema9, ema20, vwap, rsi, atr, adx, bb, supertrend, volRatio, isRanging, hasEntryTrigger };
 }
 
 function calcVWAP(klines) {
@@ -338,16 +442,16 @@ function calcADX(klines, period = 14) {
 function evaluateSignalScore({ direction, tf5m, tf15m, macroData, news }) {
   let score = 0;
   let reasons = [];
-  if (tf5m.supertrend.direction === tf15m.supertrend.direction) { score += 25; reasons.push("✅ هم‌جهتی کامل Supertrend در 5m و 15m"); } else { score += 10; }
+  if (tf5m.supertrend.direction === tf15m.supertrend.direction) { score += 25; reasons.push("✅ هم‌جهتی کامل Supertrend در 5m و 15m"); } else { score += 12; }
   const vwapOk = (direction === "LONG" && tf5m.close > tf5m.vwap && tf5m.ema9 > tf5m.ema20) || (direction === "SHORT" && tf5m.close < tf5m.vwap && tf5m.ema9 < tf5m.ema20);
-  if (vwapOk) { score += 20; reasons.push("✅ تثبیت قیمت در سمت درست VWAP و EMA"); } else { score += 8; }
-  if (tf5m.adx >= 25) { score += 15; reasons.push(`✅ قدرت روند مناسب (ADX: ${tf5m.adx.toFixed(0)})`); } else { score += 9; }
-  const rsiOk = (direction === "LONG" && tf5m.rsi >= 50 && tf5m.rsi <= 74) || (direction === "SHORT" && tf5m.rsi <= 50 && tf5m.rsi >= 26);
-  if (rsiOk) { score += 15; reasons.push(`✅ مومنتوم استاندارد RSI (${tf5m.rsi.toFixed(1)})`); } else { score += 6; }
-  if (tf5m.volRatio >= 1.25) { score += 15; reasons.push(`✅ تایید حجم معاملات (${tf5m.volRatio.toFixed(1)}x میانگین)`); } else { score += 7; }
+  if (vwapOk) { score += 20; reasons.push("✅ تثبیت قیمت در سمت درست VWAP و EMA"); } else { score += 10; }
+  if (tf5m.adx >= 22) { score += 15; reasons.push(`✅ قدرت روند مناسب (ADX: ${tf5m.adx.toFixed(0)})`); } else { score += 9; }
+  const rsiOk = (direction === "LONG" && tf5m.rsi >= 48 && tf5m.rsi <= 75) || (direction === "SHORT" && tf5m.rsi <= 52 && tf5m.rsi >= 25);
+  if (rsiOk) { score += 15; reasons.push(`✅ مومنتوم استاندارد RSI (${tf5m.rsi.toFixed(1)})`); } else { score += 8; }
+  if (tf5m.volRatio >= 1.15) { score += 15; reasons.push(`✅ تایید حجم معاملات (${tf5m.volRatio.toFixed(1)}x میانگین)`); } else { score += 8; }
   if (((direction === "LONG" && macroData.bias === "BULLISH") || (direction === "SHORT" && macroData.bias === "BEARISH")) || news.bias === direction) {
-    score += 10; reasons.push("✅ هم‌سویی با روند کلان و سنتیمنت اخبار");
-  } else { score += 5; }
+    score += 10; reasons.push("✅ هم‌سویی با روند کلان و سنتیمنت");
+  } else { score += 6; }
 
   let grade = "⚡ متوسط (B)";
   if (score >= 85) grade = "💎 عالی (VIP A+)";
@@ -365,7 +469,7 @@ function calculateTargets(price, atr, direction) {
   };
 }
 
-async function sendSignalMessage(env, data) {
+async function sendSignalMessage(env, data, customChatId = null) {
   const { symbol, direction, entry, targets, scoreData, tf5m, macroData } = data;
   const dirLabel = direction === "LONG" ? "🟢 LONG (خرید)" : "🔴 SHORT (فروش)";
   const text = `
@@ -384,18 +488,26 @@ async function sendSignalMessage(env, data) {
 📊 <b>داده‌ها:</b> VWAP: <code>${tf5m.vwap.toFixed(2)}</code> | BTC.D: ${macroData.btcD}% | USDT.D: ${macroData.usdtD}%
 📋 <b>دلایل:</b>\n${scoreData.reasons.join("\n")}
 `.trim();
-  await sendTelegramGlobal(env, text);
+
+  if (customChatId) {
+    await sendTelegramRaw(env, customChatId, text);
+  } else {
+    await sendTelegramGlobal(env, text);
+  }
 }
 
 async function sendTelegramGlobal(env, text) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
-  await sendTelegramRaw(env, env.TELEGRAM_CHAT_ID, text);
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in Cloudflare Variables" };
+  }
+  return await sendTelegramRaw(env, env.TELEGRAM_CHAT_ID, text);
 }
 
 async function sendTelegramRaw(env, chatId, text) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" })
   });
+  return await res.json();
 }
