@@ -9,4 +9,4 @@ crons = ["*/5 * * * *"]
 # بعد از ساخت KV در پنل کلودفلر، آیدی آن را اینجا جایگزین کنید
 [[kv_namespaces]]
 binding = "SIGNAL_KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "79726ac872e34a4f96dc2203e1109e04"
