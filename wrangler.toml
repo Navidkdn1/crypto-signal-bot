@@ -1,0 +1,12 @@
+name = "crypto-signal-bot"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# اجرای خودکار بات هر ۵ دقیقه یک‌بار
+[triggers]
+crons = ["*/5 * * * *"]
+
+# بعد از ساخت KV در پنل کلودفلر، آیدی آن را اینجا جایگزین کنید
+[[kv_namespaces]]
+binding = "SIGNAL_KV"
+id = "YOUR_KV_NAMESPACE_ID"
