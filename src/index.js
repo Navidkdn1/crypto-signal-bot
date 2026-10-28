@@ -1,18 +1,17 @@
 /**
- * 🚀 Crypto Scalping Signal Bot v3.0 PRO (Real-Time Institutional Edition)
+ * 🚀 Crypto Scalping Signal Bot v3.1 (High Win-Rate Institutional Edition)
  * -------------------------------------------------------------------------
- * ✅ بررسی لحظه‌ای تارگت و استاپ (هر ۱۵ ثانیه با Sub-Minute Polling)
- * ✅ ریسک‌فری خودکار (Auto Break-Even) پس از تاچ شدن TP1
- * ✅ استراتژی ارتقایافته: Supertrend + VWAP + Order Block + FVG + RSI Divergence + MACD + StochRSI
- * ✅ فیلتر سخت‌گیرانه (فقط سیگنال‌های معتبر با امتیاز بالای 78/100)
- * ✅ طراحی ظاهری VIP همراه با دکمه‌های شیشه‌ای، نوار امتیاز، درصد تارگت و اهرم پیشنهادی
- * ✅ دستورات کامل: /menu, /scan, /positions, /stats, /btc, /eth, /sol, /bnb, /force, /clear
+ * 👑 فیلتر رهبر بازار (BTC Leader Synchronization) برای محافظت از آلت‌کوین‌ها
+ * 🚫 فیلتر ضد هیجان (Anti-Chase Filter) برای جلوگیری از ورود در سقف/کف کندل‌های کشیده
+ * 📊 اتصال به دیتای فیوچرز OKX (Taker Buy/Sell Volume + Funding Rate)
+ * ⚡ سیستم تارگت اول سریع (Quick TP1 = 0.9x ATR) + ریسک‌فری خودکار ۱۵ ثانیه‌ای
+ * 🧠 موتور تحلیلی: Supertrend + VWAP + Order Block + FVG + RSI Divergence + MACD
  */
 
 const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"];
 const MAX_OPEN_POSITIONS = 2;
 const POSITION_TTL_SECONDS = 3600; // حداکثر ۶۰ دقیقه زمان مجاز پوزیشن اسکلپ
-const MIN_VALID_SCORE = 78; // فقط سیگنال‌های بسیار معتبر (A و VIP A+) ارسال شوند
+const MIN_VALID_SCORE = 78; // حداقل امتیاز برای ارسال خودکار سیگنال معتبر
 
 const BROWSER_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -22,23 +21,27 @@ const BROWSER_HEADERS = {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 export default {
-  // ۱. اجرای خودکار هر ۱ دقیقه + بررسی زیرثانیه‌ای (هر ۱۵ ثانیه) برای پوزیشن‌های باز
+  // ۱. اجرای خودکار هر ۱ دقیقه + حلقه رصد لحظه‌ای هر ۱۵ ثانیه
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runRealTimeSchedule(env));
   },
 
-  // ۲. مدیریت وب‌هوک تلگرام (پیام‌ها + دکمه‌های شیشه‌ای) و لینک‌های مرورگر
+  // ۲. مدیریت وب‌هوک تلگرام و لینک‌های مرورگر
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/diag") {
-      const prices = await fetchLivePrices();
-      const macro = await fetchMacroData();
+      const [prices, macro, btcFut] = await Promise.all([
+        fetchLivePrices(),
+        fetchMacroData(),
+        fetchOKXFuturesData("BTC")
+      ]);
       return new Response(JSON.stringify({
         ok: true,
-        version: "3.0 PRO Real-Time",
+        version: "3.1 High Win-Rate Edition",
         livePrices: prices,
-        macro
+        macro,
+        sampleFuturesData: btcFut
       }, null, 2), { headers: { "Content-Type": "application/json; charset=utf-8" } });
     }
 
@@ -51,13 +54,13 @@ export default {
       try {
         const update = await request.json();
 
-        // الف) مدیریت کلیک روی دکمه‌های شیشه‌ای (Inline Keyboard Callbacks)
+        // الف) مدیریت دکمه‌های شیشه‌ای (Inline Keyboard Callbacks)
         if (update.callback_query) {
           const cb = update.callback_query;
           const chatId = cb.message.chat.id;
           const data = cb.data;
 
-          await answerCallback(env, cb.id, "⏳ در حال انجام...");
+          await answerCallback(env, cb.id, "⏳ در حال پردازش...");
 
           if (data === "cmd_scan") await handleScanCommand(env, chatId);
           else if (data === "cmd_positions") await handlePositionsCommand(env, chatId);
@@ -70,12 +73,12 @@ export default {
           } else if (data.startsWith("close_")) {
             const sym = data.replace("close_", "");
             if (env.SIGNAL_KV) await env.SIGNAL_KV.delete(`POS_${sym}`);
-            await sendTelegramRaw(env, chatId, `✅ پوزیشن <b>#${sym}</b> به صورت دستی بسته شد و از لیست رصد خارج گردید.`);
+            await sendTelegramRaw(env, chatId, `✅ پوزیشن <b>#${sym}</b> به صورت دستی بسته شد و از رصد خارج گردید.`);
           }
           return new Response("OK", { status: 200 });
         }
 
-        // ب) مدیریت دستورات متنی در تلگرام
+        // ب) مدیریت دستورات متنی تلگرام
         if (update.message && update.message.text) {
           const chatId = update.message.chat.id;
           const text = update.message.text.trim().split("@")[0].toLowerCase();
@@ -83,14 +86,14 @@ export default {
           if (text === "/start" || text === "/menu" || text === "/help") {
             await sendMainMenu(env, chatId);
           } else if (text === "/scan") {
-            await sendTelegramRaw(env, chatId, "🔍 <b>در حال اسکن عمیق بازار و نواحی اسمارت مانی...</b>");
+            await sendTelegramRaw(env, chatId, "🔍 <b>در حال اسکن عمیق کندل‌ها، دیتای فیوچرز OKX و هم‌جهتی بیت‌کوین...</b>");
             await handleScanCommand(env, chatId);
           } else if (text === "/status" || text === "/positions") {
             await handlePositionsCommand(env, chatId);
           } else if (text === "/stats") {
             await handleStatsCommand(env, chatId);
           } else if (text === "/force") {
-            await sendTelegramRaw(env, chatId, "⚡ <b>در حال استخراج برترین موقعیت فعلی بازار...</b>");
+            await sendTelegramRaw(env, chatId, "⚡ <b>در حال استخراج بالاترین امتیاز فعلی بازار (v3.1)...</b>");
             await runBotEngine(env, true, chatId);
           } else if (text === "/clear") {
             await handleClearCommand(env, chatId);
@@ -107,22 +110,20 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    return new Response("🤖 Crypto Signal Bot v3.0 PRO is Active!", { status: 200 });
+    return new Response("🤖 Crypto Signal Bot v3.1 (High Win-Rate) is Active!", { status: 200 });
   }
 };
 
 /* =========================================================
-   ۱. موتور زمان‌بندی لحظه‌ای (Sub-Minute Real-Time Engine)
+   ۱. موتور زمان‌بندی لحظه‌ای (چک کردن تارگت/استاپ هر ۱۵ ثانیه)
 ========================================================= */
 async function runRealTimeSchedule(env) {
-  // گام اول: اسکن کامل استراتژی و چک اولیه پوزیشن‌ها در ثانیه 0
   await runBotEngine(env, false);
 
-  // گام دوم: حلقه رصد لحظه‌ای قیمت هر ۱۵ ثانیه (در ثانیه‌های ۱۵، ۳۰ و ۴۵ هر دقیقه)
   for (let tick = 1; tick <= 3; tick++) {
     await sleep(15000);
     const hasOpen = await hasAnyOpenPosition(env);
-    if (!hasOpen) break; // اگر پوزیشن بازی نیست، حلقه را متوقف کن تا منابع مصرف نشود
+    if (!hasOpen) break;
     await checkActivePositionsRealTime(env);
   }
 }
@@ -155,24 +156,18 @@ async function checkActivePositionsRealTime(env) {
     }
 
     const isLong = pos.direction === "LONG";
-    const highMark = Math.max(currentPrice, pos.lastHigh || currentPrice);
-    const lowMark = Math.min(currentPrice, pos.lastLow || currentPrice);
-    pos.lastHigh = highMark;
-    pos.lastLow = lowMark;
-
     const dec = pos.entry > 100 ? 2 : 3;
     const durationMin = Math.max(1, Math.round((Date.now() - (pos.openedAt || Date.now())) / 60000));
 
-    // ۱. بررسی برخورد با حد ضرر (یا نقطه سر به سر بعد از ریسک‌فری)
+    // ۱. بررسی برخورد با حد ضرر (یا نقطه ریسک‌فری بعد از TP1)
     const slHit = isLong ? currentPrice <= pos.sl : currentPrice >= pos.sl;
     if (slHit) {
       if (pos.tp1Hit) {
-        // چون قبلاً TP1 خورده بود، استاپ روی نقطه ورود بوده (بسته شدن در سود و ریسک‌فری)
         const msg = `
-🛡️ <b>بسته شدن در نقطه ریسک‌فری (Break-Even) | #${symbol}</b>
+🛡️ <b>خروج امن در نقطه ریسک‌فری (Break-Even) | #${symbol}</b>
 ━━━━━━━━━━━━━━━━━━
 🧭 <b>جهت:</b> ${pos.direction}
-💰 <b>وضعیت:</b> پوزیشن قبلاً <b>TP1</b> را ثبت کرده بود و مابقی حجم در نقطه ورود (<code>${pos.entry}</code>) بدون ضرر بسته شد.
+✅ <b>نتیجه:</b> این معامله قبلاً <b>تارگت اول (TP1)</b> را با موفقیت ثبت کرده بود و مابقی حجم در قیمت ورود (<code>${pos.sl}</code>) بدون ضرر بسته شد.
 ⏱ <b>مدت زمان معامله:</b> ${durationMin} دقیقه
 `.trim();
         await sendTelegramGlobal(env, msg);
@@ -184,10 +179,8 @@ async function checkActivePositionsRealTime(env) {
 ━━━━━━━━━━━━━━━━━━
 🧭 <b>جهت:</b> ${pos.direction}
 🔹 <b>قیمت ورود:</b> <code>${pos.entry}</code>
-🛑 <b>قیمت بسته شدن (SL):</b> <code>${pos.sl}</code> (<b>-${lossPct}%</b> بدون اهرم)
+🛑 <b>قیمت استاپ (SL):</b> <code>${pos.sl}</code> (<b>-${lossPct}%</b> بدون اهرم)
 ⏱ <b>مدت زمان:</b> ${durationMin} دقیقه
-
-💡 <i>پوزیشن از لیست فعال خارج شد. منتظر ستاپ معتبر بعدی باشید.</i>
 `.trim();
         await sendTelegramGlobal(env, msg);
       }
@@ -195,7 +188,7 @@ async function checkActivePositionsRealTime(env) {
       continue;
     }
 
-    // ۲. بررسی برخورد با تارگت سوم (TP3 - فول تارگت نهایی)
+    // ۲. بررسی برخورد با تارگت سوم (TP3 - فول تارگت)
     const tp3Hit = isLong ? currentPrice >= pos.tp3 : currentPrice <= pos.tp3;
     if (tp3Hit) {
       const profitPct = (Math.abs(pos.tp3 - pos.entry) / pos.entry * 100).toFixed(2);
@@ -203,13 +196,11 @@ async function checkActivePositionsRealTime(env) {
       const msg = `
 🚀💎 <b>فول تارگت نهایی (TP3 Hit!) | #${symbol}</b>
 ━━━━━━━━━━━━━━━━━━
-🧭 <b>جهت:</b> ${pos.direction === "LONG" ? "🟢 LONG" : "🔴 SHORT"}
+🧭 <b>جهت:</b> ${isLong ? "🟢 LONG" : "🔴 SHORT"}
 🔹 <b>قیمت ورود:</b> <code>${pos.entry}</code>
 🎯 <b>تارگت سوم (TP3):</b> <code>${pos.tp3}</code>
 🔥 <b>سود خالص حرکت:</b> <b>+${profitPct}%</b> (با اهرم ${pos.leverage}x: <b>+${(profitPct * pos.leverage).toFixed(1)}%</b>)
 ⏱ <b>مدت زمان:</b> ${durationMin} دقیقه
-
-🏆 <i>معامله با موفقیت کامل بسته شد!</i>
 `.trim();
       await sendTelegramGlobal(env, msg);
       await env.SIGNAL_KV.delete(`POS_${symbol}`);
@@ -221,7 +212,7 @@ async function checkActivePositionsRealTime(env) {
     if (tp2Hit && !pos.tp2Hit) {
       pos.tp2Hit = true;
       pos.tp1Hit = true;
-      pos.sl = pos.tp1; // انتقال استاپ به TP1 برای قفل کردن سود!
+      pos.sl = pos.tp1; // قفل کردن سود روی TP1
       const profitPct = (Math.abs(pos.tp2 - pos.entry) / pos.entry * 100).toFixed(2);
       await recordTradeStat(env, "WIN", parseFloat(profitPct));
 
@@ -230,7 +221,7 @@ async function checkActivePositionsRealTime(env) {
 ━━━━━━━━━━━━━━━━━━
 🔹 <b>قیمت ورود:</b> <code>${pos.entry}</code>
 ✅ <b>قیمت فعلی (TP2):</b> <code>${currentPrice.toFixed(dec)}</code> (<b>+${profitPct}%</b>)
-🛡️ <b>مدیریت هوشمند:</b> حد ضرر بات به صورت خودکار به <b>TP1 (<code>${pos.tp1}</code>)</b> منتقل شد (قفل سود تضمینی)!
+🛡️ <b>قفل سود خودکار:</b> حد ضرر بات به <b>TP1 (<code>${pos.tp1}</code>)</b> منتقل شد!
 ⏱ <b>زمان سپری‌شده:</b> ${durationMin} دقیقه
 `.trim();
       await sendTelegramGlobal(env, msg);
@@ -239,20 +230,20 @@ async function checkActivePositionsRealTime(env) {
       continue;
     }
 
-    // ۴. بررسی برخورد با تارگت اول (TP1 - سیو سود و ریسک‌فری خودکار)
+    // ۴. بررسی برخورد با تارگت اول سریع (Quick TP1 = برد تضمینی و ریسک‌فری)
     const tp1Hit = isLong ? currentPrice >= pos.tp1 : currentPrice <= pos.tp1;
     if (tp1Hit && !pos.tp1Hit) {
       pos.tp1Hit = true;
-      pos.sl = pos.entry; // انتقال خودکار استاپ به نقطه ورود (Risk-Free)
+      pos.sl = pos.entry; // انتقال آنی استاپ به نقطه ورود
       const profitPct = (Math.abs(pos.tp1 - pos.entry) / pos.entry * 100).toFixed(2);
       await recordTradeStat(env, "WIN", parseFloat(profitPct));
 
       const msg = `
-✅💰 <b>تارگت اول تاچ شد (TP1 Hit!) | #${symbol}</b>
+✅⚡ <b>تارگت اول سریع تاچ شد (Quick TP1 Hit!) | #${symbol}</b>
 ━━━━━━━━━━━━━━━━━━
 🔹 <b>قیمت ورود:</b> <code>${pos.entry}</code>
-🎯 <b>قیمت فعلی (TP1):</b> <code>${currentPrice.toFixed(dec)}</code> (<b>+${profitPct}%</b>)
-🛡️ <b>ریسک‌فری خودکار:</b> حد ضرر به نقطه ورود (<code>${pos.entry}</code>) منتقل شد! ۵۰٪ سیو سود کنید و اجازه دهید مابقی تا TP2/TP3 حرکت کند.
+🎯 <b>قیمت فعلی (TP1):</b> <code>${currentPrice.toFixed(dec)}</code> (<b>+${profitPct}%</b> | با اهرم: <b>+${(profitPct * pos.leverage).toFixed(1)}%</b>)
+🛡️ <b>ریسک‌فری خودکار فعال شد:</b> حد ضرر به نقطه ورود (<code>${pos.entry}</code>) منتقل گردید. ۶۰٪ سیو سود کنید؛ این معامله دیگر تحت هیچ شرایطی ضرر نخواهد شد!
 ⏱ <b>زمان سپری‌شده:</b> ${durationMin} دقیقه
 `.trim();
       await sendTelegramGlobal(env, msg);
@@ -267,7 +258,7 @@ async function checkActivePositionsRealTime(env) {
 }
 
 /* =========================================================
-   ۳. موتور اصلی اسکن استراتژی و فیلتر سیگنال‌های معتبر
+   ۳. موتور اصلی اسکن v3.1 (با فیلتر BTC Leader و Anti-Chase)
 ========================================================= */
 async function runBotEngine(env, forceBest = false, customChatId = null) {
   try {
@@ -275,6 +266,10 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
     if (!forceBest && activePositions >= MAX_OPEN_POSITIONS) return;
 
     const macroData = await fetchMacroData();
+
+    // گام کلیدی ۱: تحلیل وضعیت رهبر بازار (BTCUSDT) قبل از بررسی سایر ارزها
+    const btcLeader = await analyzeBTCLeader();
+
     let bestCandidate = null;
 
     for (const symbol of SYMBOLS) {
@@ -285,9 +280,11 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
         if (existingPos) continue;
       }
 
-      const [klines5m, klines15m] = await Promise.all([
+      const coin = symbol.replace("USDT", "");
+      const [klines5m, klines15m, futuresData] = await Promise.all([
         fetchKlines(symbol, "5m", 120),
-        fetchKlines(symbol, "15m", 100)
+        fetchKlines(symbol, "15m", 100),
+        fetchOKXFuturesData(coin)
       ]);
       if (klines5m.length < 60 || klines15m.length < 60) continue;
 
@@ -298,19 +295,48 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
       if (tf5m.divergence.bullish && (tf5m.orderBlock.inBullishOB || tf5m.fvg.inBullishFVG)) direction = "LONG";
       if (tf5m.divergence.bearish && (tf5m.orderBlock.inBearishOB || tf5m.fvg.inBearishFVG)) direction = "SHORT";
 
-      const coin = symbol.replace("USDT", "");
       const news = await fetchNewsSentiment(coin, env.CRYPTOPANIC_API_KEY);
-      const scoreData = evaluateInstitutionalScore({ direction, tf5m, tf15m, macroData, news });
+      const scoreData = evaluateHighWinRateScore({
+        symbol,
+        direction,
+        tf5m,
+        tf15m,
+        btcLeader,
+        futuresData,
+        macroData,
+        news
+      });
 
-      const candidate = { symbol, direction, entry: tf5m.close, tf5m, tf15m, scoreData, macroData };
+      const candidate = {
+        symbol,
+        direction,
+        entry: tf5m.close,
+        tf5m,
+        tf15m,
+        btcLeader,
+        futuresData,
+        scoreData,
+        macroData
+      };
+
       if (!bestCandidate || scoreData.score > bestCandidate.scoreData.score) {
         bestCandidate = candidate;
       }
 
-      // شرط سخت‌گیرانه صدور سیگنال خودکار:
-      // ۱. بازار رنج نباشد + ۲. ماشه ورود تایید شده باشد + ۳. امتیاز حداقل 78 از 100 باشد
-      if (!forceBest && !tf5m.isRanging && tf5m.hasValidTrigger && scoreData.score >= MIN_VALID_SCORE) {
-        const targets = calculateProTargets(tf5m.close, tf5m.atr, direction);
+      // شروط سخت‌گیرانه افزایش وین‌ریت در حالت خودکار:
+      // ۱. بازار رنج نباشد (!tf5m.isRanging)
+      // ۲. کندل بیش از حد کشیده و هیجانی نباشد (!tf5m.isOverextended -> Anti-Chase Filter)
+      // ۳. بیت‌کوین خلاف جهت پوزیشن در حال حرکت شدید نباشد (scoreData.btcAligned)
+      // ۴. امتیاز کل حداقل ۷۸ از ۱۰۰ باشد
+      if (
+        !forceBest &&
+        !tf5m.isRanging &&
+        !tf5m.isOverextended &&
+        scoreData.btcAligned &&
+        tf5m.hasValidTrigger &&
+        scoreData.score >= MIN_VALID_SCORE
+      ) {
+        const targets = calculateHighWinRateTargets(tf5m.close, tf5m.atr, direction);
         await sendProSignalMessage(env, { ...candidate, targets }, customChatId);
 
         if (env.SIGNAL_KV) {
@@ -334,7 +360,7 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
     }
 
     if (forceBest && bestCandidate) {
-      const targets = calculateProTargets(bestCandidate.entry, bestCandidate.tf5m.atr, bestCandidate.direction);
+      const targets = calculateHighWinRateTargets(bestCandidate.entry, bestCandidate.tf5m.atr, bestCandidate.direction);
       await sendProSignalMessage(env, { ...bestCandidate, targets, isForced: true }, customChatId);
     }
   } catch (error) {
@@ -343,10 +369,81 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
 }
 
 /* =========================================================
-   ۴. اندیکاتورهای پیشرفته (OB + FVG + Divergence + MACD + StochRSI)
+   ۴. تحلیل رهبر بازار (BTC Leader) و دیتای فیوچرز OKX
+========================================================= */
+async function analyzeBTCLeader() {
+  try {
+    const klines5m = await fetchKlines("BTCUSDT", "5m", 80);
+    if (klines5m.length < 50) return { bias: "NEUTRAL", dir: "LONG", strongBear: false, strongBull: false };
+
+    const tf = analyzeInstitutionalIndicators(klines5m, 7, 2.0);
+    const aboveVwap = tf.close > tf.vwap;
+    const strongBull = tf.supertrend.direction === "LONG" && aboveVwap && tf.ema9 >= tf.ema20;
+    const strongBear = tf.supertrend.direction === "SHORT" && !aboveVwap && tf.ema9 <= tf.ema20;
+
+    let bias = "NEUTRAL";
+    if (strongBull) bias = "BULLISH";
+    else if (strongBear) bias = "BEARISH";
+    else bias = tf.supertrend.direction === "LONG" ? "MILD_BULL" : "MILD_BEAR";
+
+    return {
+      price: tf.close,
+      dir: tf.supertrend.direction,
+      bias,
+      strongBull,
+      strongBear
+    };
+  } catch {
+    return { bias: "NEUTRAL", dir: "LONG", strongBear: false, strongBull: false };
+  }
+}
+
+// دریافت دیتای لحظه‌ای فیوچرز از صرافی OKX (حجم سفارشات Taker + نرخ Funding Rate)
+async function fetchOKXFuturesData(coin) {
+  let fundingRate = 0.0001; // 0.01% پیش‌فرض
+  let takerBuyRatio = 50.0;
+  let flowBias = "NEUTRAL";
+
+  try {
+    const [fundRes, takerRes] = await Promise.all([
+      fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${coin}-USDT-SWAP`, { headers: BROWSER_HEADERS }),
+      fetch(`https://www.okx.com/api/v5/rubik/stat/taker-volume?ccy=${coin}&instType=CONTRACTS&period=5m`, { headers: BROWSER_HEADERS })
+    ]);
+
+    if (fundRes.ok) {
+      const fJson = await fundRes.json();
+      if (fJson.data && fJson.data[0]) {
+        fundingRate = parseFloat(fJson.data[0].fundingRate) * 100; // تبدیل به درصد
+      }
+    }
+
+    if (takerRes.ok) {
+      const tJson = await takerRes.json();
+      // فرمت خروجی OKX: [[timestamp, sellVolume, buyVolume], ...]
+      if (tJson.data && tJson.data.length > 0) {
+        const latest = tJson.data[0];
+        const sellVol = parseFloat(latest[1]) || 1;
+        const buyVol = parseFloat(latest[2]) || 1;
+        takerBuyRatio = (buyVol / (buyVol + sellVol)) * 100;
+      }
+    }
+
+    if (takerBuyRatio >= 52.5) flowBias = "LONG";
+    else if (takerBuyRatio <= 47.5) flowBias = "SHORT";
+  } catch (e) {}
+
+  return {
+    fundingRateStr: `${fundingRate >= 0 ? "+" : ""}${fundingRate.toFixed(4)}%`,
+    fundingRate,
+    takerBuyRatio: parseFloat(takerBuyRatio.toFixed(1)),
+    flowBias
+  };
+}
+
+/* =========================================================
+   ۵. محاسبات اندیکاتورها + فیلتر ضد هیجان (Anti-Chase Filter)
 ========================================================= */
 function analyzeInstitutionalIndicators(klines, stPeriod, stMult) {
-  // استفاده از کندل بسته‌شده ماقبل آخر برای تایید قطعی و جلوگیری از Fake Wick
   const closes = klines.map(k => k.close);
   const current = klines[klines.length - 1];
   const closedCandle = klines[klines.length - 2];
@@ -373,16 +470,28 @@ function analyzeInstitutionalIndicators(klines, stPeriod, stMult) {
   const avgVol = klines.slice(-21, -1).reduce((s, k) => s + k.volume, 0) / 20;
   const volRatio = Math.max(current.volume, closedCandle.volume) / (avgVol || 1);
 
-  // تشخیص سخت‌گیرانه بازار رنج و نوسان فرسایشی (Chop Filter)
+  // ۱. فیلتر بازار رنج (Chop / Squeeze Filter)
   const isRanging = (adx < 20 && bb.bandwidth < 0.0045) || bb.bandwidth < 0.0028;
 
-  // تایید کندل بسته‌شده در جهت روند همراه با مومنتوم MACD
+  // ۲. فیلتر ضد هیجان و کندل کشیده (Anti-Chase / Anti-FOMO Filter)
+  // اگر فاصله قیمت از EMA9 بیش از 1.35 برابر ATR باشد یا بدنه کندل بیش از 1.6 برابر ATR جامپ کرده باشد -> ورود در سقف/کف ممنوع!
+  const extensionAtr = Math.abs(current.close - ema9) / (atr || 1);
+  const candleBodyAtr = Math.abs(current.close - current.open) / (atr || 1);
+  const isOverextended = extensionAtr > 1.35 || candleBodyAtr > 1.65;
+
+  // ۳. بررسی پین‌بار و جمع‌آوری نقدینگی (Wick Rejection)
+  const totalRange = (current.high - current.low) || 1;
+  const lowerWickRatio = (Math.min(current.open, current.close) - current.low) / totalRange;
+  const upperWickRatio = (current.high - Math.max(current.open, current.close)) / totalRange;
+  const hasBullishRejection = lowerWickRatio >= 0.35;
+  const hasBearishRejection = upperWickRatio >= 0.35;
+
   const bullMomentum = supertrend.direction === "LONG" && current.close > ema9 && ema9 >= ema20 && macd.histogram >= macd.prevHistogram;
   const bearMomentum = supertrend.direction === "SHORT" && current.close < ema9 && ema9 <= ema20 && macd.histogram <= macd.prevHistogram;
 
   const smcReversal =
-    (divergence.bullish && (orderBlock.inBullishOB || fvg.inBullishFVG) && current.close > current.open) ||
-    (divergence.bearish && (orderBlock.inBearishOB || fvg.inBearishFVG) && current.close < current.open);
+    (divergence.bullish && (orderBlock.inBullishOB || fvg.inBullishFVG)) ||
+    (divergence.bearish && (orderBlock.inBearishOB || fvg.inBearishFVG));
 
   const hasValidTrigger = supertrend.justFlipped || bullMomentum || bearMomentum || smcReversal;
 
@@ -391,174 +500,134 @@ function analyzeInstitutionalIndicators(klines, stPeriod, stMult) {
     ema9, ema20, ema50, vwap,
     rsi, stochRsi, macd,
     atr, adx, bb, supertrend,
-    volRatio, isRanging, hasValidTrigger,
+    volRatio, isRanging,
+    extensionAtr, isOverextended,
+    hasBullishRejection, hasBearishRejection,
+    hasValidTrigger,
     divergence, orderBlock, fvg
   };
 }
 
-// تشخیص شکاف ارزش منصفانه (Fair Value Gap - ICT FVG)
-function detectFVG(klines, atr, lookback = 25) {
-  const len = klines.length;
-  const current = klines[len - 1];
-  const start = Math.max(3, len - lookback);
-
-  let bullFVG = null;
-  let bearFVG = null;
-
-  for (let i = start; i < len - 1; i++) {
-    const c1 = klines[i - 2];
-    const c2 = klines[i - 1];
-    const c3 = klines[i];
-
-    // Bullish FVG: فاصله بین سقف کندل اول و کف کندل سوم در حرکت صعودی شارپ
-    if (c3.low > c1.high && (c2.close - c2.open) > atr * 0.7) {
-      let mitigated = false;
-      for (let j = i + 1; j < len - 1; j++) {
-        if (klines[j].low < c1.high) { mitigated = true; break; }
-      }
-      if (!mitigated) bullFVG = { bottom: c1.high, top: c3.low };
-    }
-
-    // Bearish FVG: فاصله بین کف کندل اول و سقف کندل سوم در حرکت نزولی شارپ
-    if (c3.high < c1.low && (c2.open - c2.close) > atr * 0.7) {
-      let mitigated = false;
-      for (let j = i + 1; j < len - 1; j++) {
-        if (klines[j].high > c1.low) { mitigated = true; break; }
-      }
-      if (!mitigated) bearFVG = { bottom: c3.high, top: c1.low };
-    }
-  }
-
-  const buf = atr * 0.25;
-  const inBullishFVG = Boolean(bullFVG && current.low <= bullFVG.top + buf && current.close >= bullFVG.bottom);
-  const inBearishFVG = Boolean(bearFVG && current.high >= bearFVG.bottom - buf && current.close <= bearFVG.top);
-
-  return { bullFVG, bearFVG, inBullishFVG, inBearishFVG };
-}
-
-// محاسبه MACD (12, 26, 9)
-function calcMACD(closes) {
-  const ema12Series = calcEMASeries(closes, 12);
-  const ema26Series = calcEMASeries(closes, 26);
-  const macdLine = ema12Series.map((v, i) => v - ema26Series[i]);
-  const signalLine = calcEMASeries(macdLine, 9);
-  const len = closes.length;
-  const hist = macdLine[len - 1] - signalLine[len - 1];
-  const prevHist = macdLine[len - 2] - signalLine[len - 2];
-  return { macd: macdLine[len - 1], signal: signalLine[len - 1], histogram: hist, prevHistogram: prevHist };
-}
-
-// محاسبه Stochastic RSI
-function calcStochRSI(rsiSeries, period = 14) {
-  const slice = rsiSeries.slice(-period);
-  const minRsi = Math.min(...slice);
-  const maxRsi = Math.max(...slice);
-  if (maxRsi === minRsi) return 50;
-  return ((rsiSeries[rsiSeries.length - 1] - minRsi) / (maxRsi - minRsi)) * 100;
-}
-
 /* =========================================================
-   ۵. سیستم امتیازدهی سخت‌گیرانه ۱۰۰ امتیازی (نسخه v3.0)
+   ۶. موتور امتیازدهی ۱۰۰ امتیازی نسخه v3.1 (High Win-Rate)
 ========================================================= */
-function evaluateInstitutionalScore({ direction, tf5m, tf15m, macroData, news }) {
+function evaluateHighWinRateScore({ symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news }) {
   let score = 0;
   let reasons = [];
 
-  // ۱. هم‌جهتی ساختار مولتی تایم‌فریم 5m و 15m (۲۰ امتیاز)
+  // ۱. هم‌جهتی ساختار مولتی تایم‌فریم 5m و 15m (۱۸ امتیاز)
   if (tf5m.supertrend.direction === tf15m.supertrend.direction) {
-    score += 20;
+    score += 18;
     reasons.push("✅ هم‌جهتی ساختار روند در تایم 5m و 15m");
   } else {
     score += 7;
   }
 
-  // ۲. نواحی اسمارت مانی: Order Block + FVG (۲۰ امتیاز)
+  // ۲. فیلتر رهبر بازار - هم‌جهتی با بیت‌کوین (۱۵ امتیاز)
+  let btcAligned = true;
+  if (symbol === "BTCUSDT") {
+    score += 15;
+    reasons.push("👑 ارز رهبر بازار (BTC Structure)");
+  } else {
+    if (direction === "LONG" && btcLeader.strongBear) {
+      btcAligned = false;
+      score += 2;
+      reasons.push("⚠️ هشدار: بیت‌کوین در فاز نزولی است (خطر استاپ)");
+    } else if (direction === "SHORT" && btcLeader.strongBull) {
+      btcAligned = false;
+      score += 2;
+      reasons.push("⚠️ هشدار: بیت‌کوین در فاز صعودی قوی است");
+    } else if ((direction === "LONG" && btcLeader.dir === "LONG") || (direction === "SHORT" && btcLeader.dir === "SHORT")) {
+      score += 15;
+      reasons.push(`👑 هم‌جهتی کامل با روند لحظه‌ای بیت‌کوین (${btcLeader.dir})`);
+    } else {
+      score += 9;
+    }
+  }
+
+  // ۳. نواحی اسمارت مانی: Order Block + FVG + Rejection Wick (۱۸ امتیاز)
   const inSmartBull = direction === "LONG" && (tf5m.orderBlock.inBullishOB || tf5m.fvg.inBullishFVG);
   const inSmartBear = direction === "SHORT" && (tf5m.orderBlock.inBearishOB || tf5m.fvg.inBearishFVG);
   const nearSmart = (direction === "LONG" && tf5m.orderBlock.nearBullishOB) || (direction === "SHORT" && tf5m.orderBlock.nearBearishOB);
 
   if (inSmartBull || inSmartBear) {
-    score += 20;
+    score += 18;
     reasons.push("🏦 ورود از درون ناحیه نقدینگی نهنگ‌ها (Order Block / FVG)");
-  } else if (nearSmart) {
-    score += 14;
-    reasons.push("📦 حمایت توسط ناحیه Order Block نزدیک قیمت");
+  } else if (nearSmart || (direction === "LONG" && tf5m.hasBullishRejection) || (direction === "SHORT" && tf5m.hasBearishRejection)) {
+    score += 13;
+    reasons.push("🕯️ حمایت در مجاورت Order Block همراه با شدوی بازگشتی");
   } else {
     score += 7;
   }
 
-  // ۳. واگرایی RSI + شتاب MACD و StochRSI (۱۵ امتیاز)
+  // ۴. فیلتر ضد هیجان (Anti-Chase) و فاصله استاندارد از VWAP/EMA9 (۱۴ امتیاز)
+  const vwapAligned = (direction === "LONG" && tf5m.close > tf5m.vwap && tf5m.ema9 >= tf5m.ema20) ||
+                      (direction === "SHORT" && tf5m.close < tf5m.vwap && tf5m.ema9 <= tf5m.ema20);
+  if (!tf5m.isOverextended && vwapAligned) {
+    score += 14;
+    reasons.push(`🎯 نقطه ورود بهینه و غیرهیجانی (فاصله از EMA9: ${tf5m.extensionAtr.toFixed(1)}x ATR)`);
+  } else if (tf5m.isOverextended) {
+    score += 3;
+    reasons.push("🚫 کندل کشیده و هیجانی (ریسک پولبک بالا - Anti-Chase)");
+  } else {
+    score += 8;
+  }
+
+  // ۵. دیتای فیوچرز OKX: جریان سفارشات Taker و فاندینگ ریت (۱۵ امتیاز)
+  if (futuresData.flowBias === direction) {
+    score += 15;
+    reasons.push(`📊 تایید جریان سفارشات فیوچرز OKX (Taker Buy: ${futuresData.takerBuyRatio}%)`);
+  } else if (futuresData.flowBias === "NEUTRAL") {
+    score += 10;
+  } else {
+    score += 5;
+  }
+
+  // ۶. واگرایی RSI و شتاب MACD (۱۰ امتیاز)
   const hasDiv = (direction === "LONG" && tf5m.divergence.bullish) || (direction === "SHORT" && tf5m.divergence.bearish);
   const macdAligned = (direction === "LONG" && tf5m.macd.histogram >= tf5m.macd.prevHistogram) ||
                       (direction === "SHORT" && tf5m.macd.histogram <= tf5m.macd.prevHistogram);
-
   if (hasDiv) {
-    score += 15;
-    reasons.push(`📐 تایید ${tf5m.divergence.type} + چرخش مومنتوم`);
-  } else if (macdAligned) {
-    score += 12;
-    reasons.push("✅ تایید شتاب هیستوگرام MACD و RSI");
-  } else {
-    score += 5;
-  }
-
-  // ۴. تثبیت قیمت نسبت به VWAP و آرایش EMA 9/20/50 (۱۵ امتیاز)
-  const vwapAligned = (direction === "LONG" && tf5m.close > tf5m.vwap && tf5m.ema9 > tf5m.ema20) ||
-                      (direction === "SHORT" && tf5m.close < tf5m.vwap && tf5m.ema9 < tf5m.ema20);
-  if (vwapAligned) {
-    score += 15;
-    reasons.push("✅ تثبیت قیمت در سمت درست VWAP مؤسسات و EMA 9/20");
-  } else {
-    score += 7;
-  }
-
-  // ۵. قدرت روند ADX و عدم فشردگی (۱۰ امتیاز)
-  if (tf5m.adx >= 23 && !tf5m.isRanging) {
     score += 10;
-    reasons.push(`✅ قدرت روند بالا و خروج از رِنج (ADX: ${tf5m.adx.toFixed(0)})`);
+    reasons.push(`📐 تایید ${tf5m.divergence.type}`);
+  } else if (macdAligned && !tf5m.isRanging) {
+    score += 8;
+    reasons.push("✅ تایید مومنتوم MACD و قدرت روند ADX");
   } else {
-    score += 5;
+    score += 4;
   }
 
-  // ۶. حجم پول هوشمند (۱۰ امتیاز)
-  if (tf5m.volRatio >= 1.2) {
+  // ۷. حجم معاملات و هم‌سویی با دامیننس تتر (۱۰ امتیاز)
+  const macroOk = (direction === "LONG" && macroData.bias === "BULLISH") || (direction === "SHORT" && macroData.bias === "BEARISH");
+  if (tf5m.volRatio >= 1.15 || macroOk || news.bias === direction) {
     score += 10;
-    reasons.push(`✅ ورود حجم پول هوشمند (${tf5m.volRatio.toFixed(1)}x میانگین)`);
+    reasons.push(`✅ تایید حجم (${tf5m.volRatio.toFixed(1)}x) و جریان نقدینگی کلان`);
   } else {
     score += 6;
   }
 
-  // ۷. هم‌سویی با دامیننس تتر (USDT.D) و شاخص کل (TOTAL) (۱۰ امتیاز)
-  if (((direction === "LONG" && macroData.bias === "BULLISH") || (direction === "SHORT" && macroData.bias === "BEARISH")) || news.bias === direction) {
-    score += 10;
-    reasons.push("✅ هم‌سویی با جریان نقدینگی کلان (USDT.D و TOTAL)");
-  } else {
-    score += 6;
-  }
-
-  let grade = "⚡ متوسط (رد شده در فیلتر خودکار)";
+  let grade = "⚡ متوسط (فیلتر شده)";
   if (score >= 86) grade = "💎 فوق‌معتبر (VIP A+)";
-  else if (score >= 78) grade = "🔥 معتبر و قوی (Grade A)";
+  else if (score >= 78) grade = "🔥 وین‌ریت بالا (Grade A)";
 
-  return { score, grade, reasons };
+  return { score, grade, reasons, btcAligned };
 }
 
 /* =========================================================
-   ۶. محاسبه تارگت‌های درصدی، R:R و اهرم هوشمند
+   ۷. محاسبه تارگت اول سریع (Quick TP1 = 0.9x ATR) برای حداکثر وین‌ریت
 ========================================================= */
-function calculateProTargets(price, atr, direction) {
+function calculateHighWinRateTargets(price, atr, direction) {
   const dec = price > 100 ? 2 : 3;
   const m = direction === "LONG" ? 1 : -1;
 
-  // استاپ استاندارد بر اساس نوسان ATR
-  const riskDist = atr * 1.45;
-  const slPrice = price - m * riskDist;
-  const tp1Price = price + m * (riskDist * 1.1); // R:R = 1:1.1 (سیو سود سریع و ریسک‌فری)
-  const tp2Price = price + m * (riskDist * 2.0); // R:R = 1:2.0 (تارگت اصلی اسکلپ)
-  const tp3Price = price + m * (riskDist * 3.2); // R:R = 1:3.2 (تارگت امتدادی)
+  // فرمول اختصاصی وین‌ریت بالا:
+  // TP1 بسیار نزدیک (0.9x ATR) برای سیو سود سریع و ریسک‌فری کردن معامله در دقایق اول
+  const slPrice = price - m * (atr * 1.40);
+  const tp1Price = price + m * (atr * 0.90); // تارگت اول سریع (احتمال برخورد ~80%)
+  const tp2Price = price + m * (atr * 1.85); // تارگت دوم استاندارد
+  const tp3Price = price + m * (atr * 3.00); // تارگت سوم امتدادی
 
-  // محدوده ورود بهینه (Entry Zone)
-  const zoneLow = (price - m * (atr * 0.25)).toFixed(dec);
+  const zoneLow = (price - m * (atr * 0.20)).toFixed(dec);
   const zoneHigh = price.toFixed(dec);
 
   const slPct = ((Math.abs(price - slPrice) / price) * 100).toFixed(2);
@@ -566,7 +635,6 @@ function calculateProTargets(price, atr, direction) {
   const tp2Pct = ((Math.abs(tp2Price - price) / price) * 100).toFixed(2);
   const tp3Pct = ((Math.abs(tp3Price - price) / price) * 100).toFixed(2);
 
-  // محاسبه اهرم امن بر اساس فاصله استاپ (به طوری که استاپ بیش از ۵٪ تا ۸٪ مارجین نشود)
   const rawLev = Math.round(6 / Math.max(0.3, parseFloat(slPct)));
   const leverage = Math.min(15, Math.max(3, rawLev));
 
@@ -582,17 +650,17 @@ function calculateProTargets(price, atr, direction) {
 }
 
 /* =========================================================
-   ۷. طراحی جدید و حرفه‌ای پیام سیگنال با دکمه‌های شیشه‌ای
+   ۸. ارسال کارت سیگنال VIP و مدیریت دستورات تلگرام
 ========================================================= */
 function buildScoreBar(score) {
-  const filled = Math.round(score / 10);
+  const filled = Math.min(10, Math.max(0, Math.round(score / 10)));
   return "🟩".repeat(filled) + "⬜".repeat(10 - filled);
 }
 
 async function sendProSignalMessage(env, data, customChatId = null) {
-  const { symbol, direction, entry, targets, scoreData, tf5m, macroData, isForced } = data;
+  const { symbol, direction, entry, targets, scoreData, tf5m, btcLeader, futuresData, macroData, isForced } = data;
   const isLong = direction === "LONG";
-  const headerBadge = isForced ? "⚡ <b>سیگنال درخواستی لحظه‌ای (/force)</b>" : "🚨 <b>سیگنال اسکلپ VIP تاییدشده</b>";
+  const headerBadge = isForced ? "⚡ <b>سیگنال درخواستی لحظه‌ای (/force)</b>" : "🚨 <b>سیگنال اسکلپ VIP (وین‌ریت بالا v3.1)</b>";
   const dirBanner = isLong ? "🟢 <b>LONG (خرید / صعودی)</b> 📈" : "🔴 <b>SHORT (فروش / نزولی)</b> 📉";
   const dec = entry > 100 ? 2 : 3;
 
@@ -609,28 +677,30 @@ ${headerBadge}
 ━━━━━━━━━━━━━━━━━━
 🧭 <b>جهت معامله:</b> ${dirBanner}
 ⚡ <b>اهرم پیشنهادی:</b> <code>Isolated ${targets.leverage}x</code>
-📊 <b>اعتبار سیگنال:</b> <b>${scoreData.score}/100</b> (${scoreData.grade})
+📊 <b>امتیاز وین‌ریت:</b> <b>${scoreData.score}/100</b> (${scoreData.grade})
 ${buildScoreBar(scoreData.score)}
 
-🎯 <b>نقاط ورود و تارگت‌های دقیق:</b>
+🎯 <b>نقاط ورود و تارگت‌های هوشمند:</b>
 🔹 <b>قیمت ورود (Entry):</b> <code>${entry}</code>
 🎯 <b>محدوده ورود بهینه:</b> <code>${targets.entryZone}</code>
 
-✅ <b>تارگت ۱ (سیو سود و ریسک‌فری):</b> <code>${targets.tp1}</code> (<b>+${targets.tp1Pct}%</b>)
+⚡ <b>تارگت ۱ سریع (ریوارد سریع + ریسک‌فری):</b> <code>${targets.tp1}</code> (<b>+${targets.tp1Pct}%</b>)
 🔥 <b>تارگت ۲ (تارگت اصلی اسکلپ):</b> <code>${targets.tp2}</code> (<b>+${targets.tp2Pct}%</b>)
-🚀 <b>تارگت ۳ (تارگت امتدادی):</b> <code>${targets.tp3}</code> (<b>+${targets.tp3Pct}%</b>)
+🚀 <b>تارگت ۳ (تارگت موج کامل):</b> <code>${targets.tp3}</code> (<b>+${targets.tp3Pct}%</b>)
 🛑 <b>حد ضرر (Stop-Loss):</b> <code>${targets.sl}</code> (<b>-${targets.slPct}%</b>)
 
-🧠 <b>تحلیل اسمارت مانی و کلان:</b>
+📊 <b>دیتای فیوچرز OKX و اسمارت مانی:</b>
+• <b>حجم خریداران مارکت (Taker Buy):</b> <b>${futuresData.takerBuyRatio}%</b>
+• <b>نرخ فاندینگ (Funding Rate):</b> <code>${futuresData.fundingRateStr}</code>
+• <b>وضعیت رهبر بازار (BTC):</b> ${btcLeader.dir === "LONG" ? "🟢 همراه و صعودی" : "🔴 نزولی"}
 • <b>ناحیه نقدینگی:</b> ${smcText}
-• <b>واگرایی RSI:</b> ${tf5m.divergence.type !== "NONE" ? tf5m.divergence.type : "روند نرمال"}
-• <b>VWAP:</b> <code>${tf5m.vwap.toFixed(dec)}</code> | <b>RSI:</b> ${tf5m.rsi.toFixed(1)} | <b>ADX:</b> ${tf5m.adx.toFixed(0)}
+• <b>فاصله از EMA9 (Anti-Chase):</b> ${tf5m.extensionAtr.toFixed(2)}x ATR ${tf5m.isOverextended ? "⚠️ (کشیده)" : "✅ (استاندارد)"}
 • <b>دامیننس‌ها:</b> BTC.D: ${macroData.btcD}% | USDT.D: ${macroData.usdtD}%
 
-📋 <b>تاییدیه‌های استراتژی:</b>
+📋 <b>چک‌لیست تاییدیه استراتژی:</b>
 ${scoreData.reasons.join("\n")}
 
-🤖 <i>بات هر ۱۵ ثانیه این پوزیشن را رصد می‌کند و به محض تاچ شدن TP یا SL به شما اطلاع می‌دهد.</i>
+🤖 <i>رصد ۱۵ ثانیه‌ای فعال است: به محض تاچ شدن TP1، بات پیام می‌دهد و استاپ را خودکار به نقطه ورود منتقل می‌کند.</i>
 `.trim();
 
   const replyMarkup = {
@@ -653,22 +723,21 @@ ${scoreData.reasons.join("\n")}
   await sendTelegramRaw(env, targetChat, text, replyMarkup);
 }
 
-/* =========================================================
-   ۸. مدیریت دستورات جدید (/menu, /positions, /stats, /btc ...)
-========================================================= */
+// منوی اصلی شیشه‌ای
 async function sendMainMenu(env, chatId) {
   const text = `
-🤖 <b>پنل هوشمند اسکلپ کریپتو (نسخه v3.0 PRO)</b>
+🤖 <b>پنل هوشمند اسکلپ کریپتو (نسخه v3.1 High Win-Rate)</b>
 ━━━━━━━━━━━━━━━━━━
-⚡ <b>وضعیت رصد لحظه‌ای:</b> فعال (چک کردن قیمت هر ۱۵ ثانیه)
-🎯 <b>فیلتر اعتبار سیگنال:</b> فقط سیگنال‌های بالای <b>${MIN_VALID_SCORE}/100</b>
-🪙 <b>ارزهای تحت پوشش:</b> BTC, ETH, SOL, BNB
+👑 <b>فیلتر رهبر بازار (BTC Leader):</b> فعال ✅
+🚫 <b>فیلتر ضد هیجان (Anti-Chase):</b> فعال ✅
+📊 <b>دیتای فیوچرز OKX (Taker & Funding):</b> متصل ✅
+⚡ <b>تارگت اول سریع (Quick TP1 = 0.9x ATR):</b> فعال ✅
 
 👇 <b>از دکمه‌های شیشه‌ای زیر یا دستورات متنی استفاده کنید:</b>
-• /scan — اسکن عمیق هر ۴ ارز در همین لحظه
+• /scan — اسکن کامل ۴ ارز + وضعیت فیوچرز و بیت‌کوین
 • /positions — سود و ضرر لحظه‌ای پوزیشن‌های باز
-• /btc | /eth | /sol | /bnb — کالبدشکافی تکی هر ارز
-• /stats — کارنامه و وین‌ریت سیگنال‌های بات
+• /btc | /eth | /sol | /bnb — کالبدشکافی تخصصی هر ارز
+• /stats — کارنامه و نرخ برد (Win-Rate) بات
 • /force — دریافت فوری بهترین سیگنال فعلی بازار
 `.trim();
 
@@ -696,10 +765,13 @@ async function sendMainMenu(env, chatId) {
 
 // دستور /btc, /eth, /sol, /bnb : کالبدشکافی دقیق یک ارز
 async function handleSingleCoinCommand(env, chatId, symbol) {
-  const [klines5m, klines15m, macroData] = await Promise.all([
+  const coin = symbol.replace("USDT", "");
+  const [klines5m, klines15m, macroData, btcLeader, futuresData] = await Promise.all([
     fetchKlines(symbol, "5m", 120),
     fetchKlines(symbol, "15m", 100),
-    fetchMacroData()
+    fetchMacroData(),
+    analyzeBTCLeader(),
+    fetchOKXFuturesData(coin)
   ]);
 
   if (klines5m.length < 60 || klines15m.length < 60) {
@@ -710,27 +782,32 @@ async function handleSingleCoinCommand(env, chatId, symbol) {
   const tf5m = analyzeInstitutionalIndicators(klines5m, 7, 2.0);
   const tf15m = analyzeInstitutionalIndicators(klines15m, 10, 3.0);
   const direction = tf5m.supertrend.direction;
-  const scoreData = evaluateInstitutionalScore({ direction, tf5m, tf15m, macroData, news: { bias: "NEUTRAL" } });
-  const targets = calculateProTargets(tf5m.close, tf5m.atr, direction);
+  const scoreData = evaluateHighWinRateScore({
+    symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
+  });
+  const targets = calculateHighWinRateTargets(tf5m.close, tf5m.atr, direction);
   const dec = tf5m.close > 100 ? 2 : 3;
 
   const text = `
-🔬 <b>کالبدشکافی لحظه‌ای (X-Ray) | #${symbol}</b>
+🔬 <b>کالبدشکافی تخصصی (X-Ray v3.1) | #${symbol}</b>
 ━━━━━━━━━━━━━━━━━━
 💰 <b>قیمت لحظه‌ای:</b> <code>${tf5m.close}</code>
 🧭 <b>روند ۵ دقیقه:</b> ${direction === "LONG" ? "🟢 صعودی" : "🔴 نزولی"} | <b>روند ۱۵ دقیقه:</b> ${tf15m.supertrend.direction === "LONG" ? "🟢 صعودی" : "🔴 نزولی"}
-⭐ <b>امتیاز اعتبار فعلی:</b> <b>${scoreData.score}/100</b> (${scoreData.score >= MIN_VALID_SCORE ? "✅ واجد شرایط سیگنال" : "⏳ منتظر تکمیل شروط"})
+⭐ <b>امتیاز وین‌ریت:</b> <b>${scoreData.score}/100</b>
 ${buildScoreBar(scoreData.score)}
 
-📊 <b>جزئیات اندیکاتورها:</b>
-• <b>وضعیت بازار:</b> ${tf5m.isRanging ? "⚠️ رِنج و فرسایشی (ورود ممنوع)" : "✅ رونددار و مناسب اسکلپ"}
-• <b>VWAP:</b> <code>${tf5m.vwap.toFixed(dec)}</code> | <b>EMA 9/20:</b> <code>${tf5m.ema9.toFixed(dec)}</code> / <code>${tf5m.ema20.toFixed(dec)}</code>
-• <b>RSI (14):</b> ${tf5m.rsi.toFixed(1)} | <b>StochRSI:</b> ${tf5m.stochRsi.toFixed(0)}% | <b>ADX:</b> ${tf5m.adx.toFixed(1)}
-• <b>واگرایی:</b> ${tf5m.divergence.type !== "NONE" ? tf5m.divergence.type : "ندارد"}
-• <b>FVG فعال:</b> ${tf5m.fvg.inBullishFVG ? "🟢 داخل Bullish FVG" : tf5m.fvg.inBearishFVG ? "🔴 داخل Bearish FVG" : "خارج از FVG"}
+🛡️ <b>فیلترهای محافظ وین‌ریت:</b>
+• <b>هم‌جهتی با BTC:</b> ${scoreData.btcAligned ? "✅ تایید شده" : "🚫 خلاف جهت بیت‌کوین (ورود خطرناک)"}
+• <b>فیلتر Anti-Chase:</b> ${tf5m.isOverextended ? "🚫 کندل بیش از حد کشیده (صبر برای پولبک)" : "✅ قیمت در محدوده استاندارد ورود"}
+• <b>فیلتر بازار رِنج:</b> ${tf5m.isRanging ? "⚠️ بازار رِنج و فرسایشی" : "✅ بازار رونددار"}
+
+📊 <b>دیتای فیوچرز OKX و تکنیکال:</b>
+• <b>حجم خریداران مارکت (Taker Buy):</b> <b>${futuresData.takerBuyRatio}%</b> (${futuresData.flowBias})
+• <b>نرخ فاندینگ (Funding Rate):</b> <code>${futuresData.fundingRateStr}</code>
+• <b>VWAP:</b> <code>${tf5m.vwap.toFixed(dec)}</code> | <b>RSI:</b> ${tf5m.rsi.toFixed(1)} | <b>ADX:</b> ${tf5m.adx.toFixed(1)}
 
 🎯 <b>سطوح کلیدی در صورت ورود (${direction}):</b>
-• <b>TP1:</b> <code>${targets.tp1}</code> | <b>TP2:</b> <code>${targets.tp2}</code> | <b>SL:</b> <code>${targets.sl}</code>
+• <b>Quick TP1:</b> <code>${targets.tp1}</code> (+${targets.tp1Pct}%) | <b>TP2:</b> <code>${targets.tp2}</code> | <b>SL:</b> <code>${targets.sl}</code>
 `.trim();
 
   const replyMarkup = {
@@ -745,67 +822,18 @@ ${buildScoreBar(scoreData.score)}
   await sendTelegramRaw(env, chatId, text, replyMarkup);
 }
 
-// دستور /positions یا /status : نمایش سود/ضرر لحظه‌ای پوزیشن‌های باز
-async function handlePositionsCommand(env, chatId) {
-  const [macro, livePrices] = await Promise.all([fetchMacroData(), fetchLivePrices()]);
-  let activeCards = [];
-
-  if (env.SIGNAL_KV) {
-    for (const symbol of SYMBOLS) {
-      const raw = await env.SIGNAL_KV.get(`POS_${symbol}`);
-      if (raw) {
-        const p = JSON.parse(raw);
-        const cur = livePrices[symbol] || p.entry;
-        const isLong = p.direction === "LONG";
-        const pnlPct = (((isLong ? cur - p.entry : p.entry - cur) / p.entry) * 100).toFixed(2);
-        const levPnl = (pnlPct * (p.leverage || 5)).toFixed(1);
-        const pnlEmoji = pnlPct >= 0 ? "🟢" : "🔴";
-
-        activeCards.push(
-          `🔸 <b>#${symbol}</b> (${isLong ? "🟢 LONG" : "🔴 SHORT"} | ${p.leverage || 5}x)\n` +
-          `   ورود: <code>${p.entry}</code> | قیمت الان: <code>${cur}</code>\n` +
-          `   ${pnlEmoji} <b>سود/ضرر لحظه‌ای:</b> <b>${pnlPct}%</b> (با اهرم: <b>${levPnl}%</b>)\n` +
-          `   🎯 TP1: <code>${p.tp1}</code> ${p.tp1Hit ? "✅" : "⏳"} | TP2: <code>${p.tp2}</code> ${p.tp2Hit ? "✅" : "⏳"} | 🛑 SL: <code>${p.sl}</code>`
-        );
-      }
-    }
-  }
-
-  const posText = activeCards.length > 0 ? activeCards.join("\n\n") : "هیچ پوزیشن بازی در حال حاضر وجود ندارد. 🟢";
-
-  const report = `
-📂 <b>وضعیت لحظه‌ای پوزیشن‌ها و بازار (Live PnL)</b>
-━━━━━━━━━━━━━━━━━━
-🌐 <b>وضعیت کلان بازار:</b>
-• <b>BTC.D:</b> ${macro.btcD}% | <b>USDT.D:</b> ${macro.usdtD}%
-• <b>تغییرات TOTAL:</b> ${macro.total24h}% (${macro.bias})
-
-📊 <b>پوزیشن‌های تحت رصد (چک هر ۱۵ ثانیه):</b>
-${posText}
-`.trim();
-
-  const replyMarkup = {
-    inline_keyboard: [
-      [
-        { text: "🔄 رفرش لحظه‌ای سود/ضرر", callback_data: "cmd_positions" },
-        { text: "🗑️ بستن همه پوزیشن‌ها (/clear)", callback_data: "cmd_clear" }
-      ]
-    ]
-  };
-
-  await sendTelegramRaw(env, chatId, report, replyMarkup);
-}
-
-// دستور /scan : اسکن کلی هر ۴ ارز
+// دستور /scan : اسکن کلی هر ۴ ارز با فیلترهای v3.1
 async function handleScanCommand(env, chatId) {
   try {
-    const macroData = await fetchMacroData();
+    const [macroData, btcLeader] = await Promise.all([fetchMacroData(), analyzeBTCLeader()]);
     let lines = [];
 
     for (const symbol of SYMBOLS) {
-      const [klines5m, klines15m] = await Promise.all([
+      const coin = symbol.replace("USDT", "");
+      const [klines5m, klines15m, futuresData] = await Promise.all([
         fetchKlines(symbol, "5m", 120),
-        fetchKlines(symbol, "15m", 100)
+        fetchKlines(symbol, "15m", 100),
+        fetchOKXFuturesData(coin)
       ]);
 
       if (klines5m.length < 60 || klines15m.length < 60) {
@@ -816,27 +844,33 @@ async function handleScanCommand(env, chatId) {
       const tf5m = analyzeInstitutionalIndicators(klines5m, 7, 2.0);
       const tf15m = analyzeInstitutionalIndicators(klines15m, 10, 3.0);
       const direction = tf5m.supertrend.direction;
-      const scoreData = evaluateInstitutionalScore({ direction, tf5m, tf15m, macroData, news: { bias: "NEUTRAL" } });
+      const scoreData = evaluateHighWinRateScore({
+        symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
+      });
 
-      const rangeStatus = tf5m.isRanging ? "⚠️ رِنج" : "✅ رونددار";
       const dirEmoji = direction === "LONG" ? "🟢 LONG" : "🔴 SHORT";
-      const validBadge = scoreData.score >= MIN_VALID_SCORE && !tf5m.isRanging ? "🔥 <b>واجد شرایط سیگنال!</b>" : "⏳ در انتظار تایید";
+      let statusBadge = "✅ آماده شکار";
+      if (tf5m.isRanging) statusBadge = "⚠️ بازار رِنج";
+      else if (tf5m.isOverextended) statusBadge = "🚫 کندل کشیده (صبر برای پولبک)";
+      else if (!scoreData.btcAligned) statusBadge = "🚫 خلاف جهت BTC";
 
       lines.push(
         `🔹 <b>#${symbol}</b> | قیمت: <code>${tf5m.close}</code>\n` +
-        `   جهت: <b>${dirEmoji}</b> | امتیاز: <b>${scoreData.score}/100</b> (${validBadge})\n` +
-        `   وضعیت: ${rangeStatus} | RSI: ${tf5m.rsi.toFixed(1)} | ADX: ${tf5m.adx.toFixed(0)}`
+        `   جهت: <b>${dirEmoji}</b> | امتیاز: <b>${scoreData.score}/100</b>\n` +
+        `   وضعیت: ${statusBadge}\n` +
+        `   📊 Taker Buy: <b>${futuresData.takerBuyRatio}%</b> | Funding: <code>${futuresData.fundingRateStr}</code>`
       );
     }
 
     const msg = `
-🔎 <b>نتیجه اسکن لحظه‌ای بازار (v3.0 PRO)</b>
+🔎 <b>نتیجه اسکن هوشمند بازار (v3.1 High Win-Rate)</b>
 ━━━━━━━━━━━━━━━━━━
+👑 <b>وضعیت رهبر بازار (BTC):</b> ${btcLeader.dir === "LONG" ? "🟢 صعودی" : "🔴 نزولی"} (${btcLeader.bias})
 🌐 <b>BTC.D:</b> ${macroData.btcD}% | <b>USDT.D:</b> ${macroData.usdtD}% | <b>TOTAL:</b> ${macroData.total24h}%
 
 ${lines.join("\n\n")}
 
-💡 <i>حداقل امتیاز برای ارسال خودکار سیگنال: <b>${MIN_VALID_SCORE}/100</b></i>
+💡 <i>حداقل امتیاز ارسال خودکار: <b>${MIN_VALID_SCORE}/100</b> (به شرط تایید BTC و عدم کشیدگی کندل)</i>
 `.trim();
 
     const replyMarkup = {
@@ -859,7 +893,56 @@ ${lines.join("\n\n")}
   }
 }
 
-// دستور /stats : نمایش وین‌ریت و عملکرد بات
+// دستور /positions : سود و ضرر لحظه‌ای پوزیشن‌های باز
+async function handlePositionsCommand(env, chatId) {
+  const [macro, livePrices] = await Promise.all([fetchMacroData(), fetchLivePrices()]);
+  let activeCards = [];
+
+  if (env.SIGNAL_KV) {
+    for (const symbol of SYMBOLS) {
+      const raw = await env.SIGNAL_KV.get(`POS_${symbol}`);
+      if (raw) {
+        const p = JSON.parse(raw);
+        const cur = livePrices[symbol] || p.entry;
+        const isLong = p.direction === "LONG";
+        const pnlPct = (((isLong ? cur - p.entry : p.entry - cur) / p.entry) * 100).toFixed(2);
+        const levPnl = (pnlPct * (p.leverage || 5)).toFixed(1);
+        const pnlEmoji = pnlPct >= 0 ? "🟢" : "🔴";
+
+        activeCards.push(
+          `🔸 <b>#${symbol}</b> (${isLong ? "🟢 LONG" : "🔴 SHORT"} | ${p.leverage || 5}x)\n` +
+          `   ورود: <code>${p.entry}</code> | قیمت الان: <code>${cur}</code>\n` +
+          `   ${pnlEmoji} <b>سود/ضرر لحظه‌ای:</b> <b>${pnlPct}%</b> (با اهرم: <b>${levPnl}%</b>)\n` +
+          `   ⚡ Quick TP1: <code>${p.tp1}</code> ${p.tp1Hit ? "✅ (ریسک‌فری شده)" : "⏳"} | TP2: <code>${p.tp2}</code> | 🛑 SL: <code>${p.sl}</code>`
+        );
+      }
+    }
+  }
+
+  const posText = activeCards.length > 0 ? activeCards.join("\n\n") : "هیچ پوزیشن بازی در حال حاضر وجود ندارد. 🟢";
+
+  const report = `
+📂 <b>وضعیت لحظه‌ای پوزیشن‌ها (Live PnL v3.1)</b>
+━━━━━━━━━━━━━━━━━━
+🌐 <b>BTC.D:</b> ${macro.btcD}% | <b>USDT.D:</b> ${macro.usdtD}% | <b>TOTAL:</b> ${macro.total24h}%
+
+📊 <b>پوزیشن‌های تحت رصد (چک هر ۱۵ ثانیه):</b>
+${posText}
+`.trim();
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: "🔄 رفرش لحظه‌ای سود/ضرر", callback_data: "cmd_positions" },
+        { text: "🗑️ بستن همه پوزیشن‌ها (/clear)", callback_data: "cmd_clear" }
+      ]
+    ]
+  };
+
+  await sendTelegramRaw(env, chatId, report, replyMarkup);
+}
+
+// دستور /stats : کارنامه و وین‌ریت بات
 async function handleStatsCommand(env, chatId) {
   let stats = { wins: 0, losses: 0, netPct: 0 };
   if (env.SIGNAL_KV) {
@@ -870,10 +953,10 @@ async function handleStatsCommand(env, chatId) {
   const winRate = total > 0 ? ((stats.wins / total) * 100).toFixed(1) : "0.0";
 
   const text = `
-📈 <b>آمار عملکرد و وین‌ریت بات (Win-Rate Stats)</b>
+📈 <b>کارنامه و نرخ برد بات (Win-Rate Stats v3.1)</b>
 ━━━━━━━━━━━━━━━━━━
-✅ <b>تارگت‌های موفق (Wins):</b> ${stats.wins}
-🛑 <b>حد ضررها (Losses):</b> ${stats.losses}
+✅ <b>معاملات برنده (TP1/TP2/TP3):</b> ${stats.wins}
+🛑 <b>معاملات استاپ‌شده (SL):</b> ${stats.losses}
 🏆 <b>نرخ برد (Win Rate):</b> <b>${winRate}%</b>
 💰 <b>برآیند خالص درصدی (بدون اهرم):</b> <b>${stats.netPct >= 0 ? "+" : ""}${stats.netPct.toFixed(2)}%</b>
 `.trim();
@@ -898,16 +981,14 @@ async function handleClearCommand(env, chatId) {
   if (env.SIGNAL_KV) {
     for (const sym of SYMBOLS) await env.SIGNAL_KV.delete(`POS_${sym}`);
   }
-  await sendTelegramRaw(env, chatId, "🗑️ تمام پوزیشن‌های فعال پاکسازی شدند و بات آماده شکار موقعیت‌های جدید است.");
+  await sendTelegramRaw(env, chatId, "🗑️ تمام پوزیشن‌های فعال پاکسازی شدند.");
 }
 
 /* =========================================================
-   ۹. دریافت قیمت‌های لحظه‌ای و کندل‌ها (ضدتحریم)
+   ۹. دریافت قیمت‌های لحظه‌ای و کندل‌ها (Multi-Exchange)
 ========================================================= */
 async function fetchLivePrices() {
   const prices = {};
-
-  // تلاش اول: OKX Tickers
   try {
     const res = await fetch("https://www.okx.com/api/v5/market/tickers?instType=SPOT", { headers: BROWSER_HEADERS });
     if (res.ok) {
@@ -922,7 +1003,6 @@ async function fetchLivePrices() {
     }
   } catch (e) {}
 
-  // تلاش دوم: Gate.io یا کندل آخر
   for (const sym of SYMBOLS) {
     if (!prices[sym]) {
       const kl = await fetchKlines(sym, "5m", 55);
@@ -1034,8 +1114,51 @@ async function fetchNewsSentiment(coin, apiKey) {
 }
 
 /* =========================================================
-   ۱۰. توابع پایه ریاضی و ارسال تلگرام
+   ۱۰. توابع ریاضی اندیکاتورها (OB, FVG, Divergence, MACD, Supertrend)
 ========================================================= */
+function detectFVG(klines, atr, lookback = 25) {
+  const len = klines.length, current = klines[len - 1], start = Math.max(3, len - lookback);
+  let bullFVG = null, bearFVG = null;
+  for (let i = start; i < len - 1; i++) {
+    const c1 = klines[i - 2], c2 = klines[i - 1], c3 = klines[i];
+    if (c3.low > c1.high && (c2.close - c2.open) > atr * 0.7) {
+      let mit = false;
+      for (let j = i + 1; j < len - 1; j++) if (klines[j].low < c1.high) { mit = true; break; }
+      if (!mit) bullFVG = { bottom: c1.high, top: c3.low };
+    }
+    if (c3.high < c1.low && (c2.open - c2.close) > atr * 0.7) {
+      let mit = false;
+      for (let j = i + 1; j < len - 1; j++) if (klines[j].high > c1.low) { mit = true; break; }
+      if (!mit) bearFVG = { bottom: c3.high, top: c1.low };
+    }
+  }
+  const buf = atr * 0.25;
+  return {
+    bullFVG, bearFVG,
+    inBullishFVG: Boolean(bullFVG && current.low <= bullFVG.top + buf && current.close >= bullFVG.bottom),
+    inBearishFVG: Boolean(bearFVG && current.high >= bearFVG.bottom - buf && current.close <= bearFVG.top)
+  };
+}
+
+function calcMACD(closes) {
+  const e12 = calcEMASeries(closes, 12), e26 = calcEMASeries(closes, 26);
+  const macdLine = e12.map((v, i) => v - e26[i]);
+  const sigLine = calcEMASeries(macdLine, 9);
+  const len = closes.length;
+  return {
+    macd: macdLine[len - 1],
+    signal: sigLine[len - 1],
+    histogram: macdLine[len - 1] - sigLine[len - 1],
+    prevHistogram: macdLine[len - 2] - sigLine[len - 2]
+  };
+}
+
+function calcStochRSI(rsiSeries, period = 14) {
+  const s = rsiSeries.slice(-period);
+  const min = Math.min(...s), max = Math.max(...s);
+  return max === min ? 50 : ((rsiSeries[rsiSeries.length - 1] - min) / (max - min)) * 100;
+}
+
 function calcRSISeries(closes, period = 14) {
   const rsiArr = new Array(closes.length).fill(50);
   if (closes.length <= period) return rsiArr;
@@ -1056,8 +1179,7 @@ function calcRSISeries(closes, period = 14) {
 }
 
 function detectRSIDivergence(klines, rsiSeries, lookback = 30) {
-  const len = klines.length;
-  const start = Math.max(5, len - lookback);
+  const len = klines.length, start = Math.max(5, len - lookback);
   let lows = [], highs = [];
   for (let i = start; i < len - 1; i++) {
     if (klines[i].low <= klines[i - 1].low && klines[i].low <= klines[i - 2].low && klines[i].low <= klines[i + 1].low) {
