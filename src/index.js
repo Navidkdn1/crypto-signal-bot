@@ -1,5 +1,5 @@
 /**
- * 🚀 Crypto Scalping Signal Bot v4.0 (Sniper Anti-Stop-Hunt Edition)
+ * 🚀 Crypto Scalping Signal Bot v5.0 (Trend-Pullback + 1H Filter + Trailing + Honest Stats)
  * -----------------------------------------------------------------
  * 🛡️ حد ضرر ساختاری (Structural SL): قرارگیری استاپ پشت Swing High/Low و Order Block واقعی
  * 🎯 حذف ورود در قله/دره: ورود فقط در «پولبک به EMA20/VWAP/OB» یا «شکار نقدینگی (Liquidity Sweep)»
@@ -12,6 +12,26 @@ const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"];
 const DEFAULT_MAX_POSITIONS = 2;
 const DEFAULT_MIN_SCORE = 80; // افزایش کیفیت پایه برای جلوگیری از معاملات ضعیف
 const MAX_TRADE_DURATION_MIN = 75;
+
+// ---- v4.1 tunables (همه‌ی این‌ها باید با بک‌تست تنظیم شوند) ----
+const REQUIRE_1H_TREND = true;     // هم‌جهتی اجباری با روند ۱ ساعته (Supertrend + EMA50)
+const MIN_ADX_5M = 18;             // زیر این مقدار بازار رنج حساب می‌شود (ADX واقعی Wilder)
+const MAX_CHASE_ATR = 0.6;         // اگر قیمت زنده بیش از این مقدار (ATR) از کلوز کندل سیگنال در جهت معامله دور شده، ورود ممنوع
+const SWEEP_MIN_VOL_RATIO = 1.0;   // حجم کندل Sweep باید حداقل برابر میانگین باشد
+const MIN_SL_ATR = 1.35;           // حداقل فاصله استاپ (جلوگیری از نویز)
+const MAX_STRUCT_SL_ATR = 2.8;     // اگر استاپ ساختاری دورتر از این باشد، سیگنال حذف می‌شود (دیگر استاپ را داخل ساختار نمی‌کشیم)
+const LOSS_COOLDOWN_SEC = 3600;    // بعد از هر استاپ، ۱ ساعت روی همان ارز سیگنال نده
+const MAX_LOSS_STREAK = 3;         // بعد از ۳ ضرر پشت‌سرهم، کل بات مکث می‌کند
+const LOSS_PAUSE_SEC = 7200;       // مدت مکث (۲ ساعت)
+const TP1_SCALE_OUT = 0.5;         // سهم پوزیشن که در TP1 بسته می‌شود (برای محاسبه‌ی نتیجه‌ی واقعی)
+// ---- v5 (استراتژی Trend-Pullback + Trailing) ----
+const TP1_R = 1.0, TP2_R = 2.0, TP3_R = 3.0; // تارگت‌ها بر حسب R (۱R = فاصله‌ی استاپ)
+const TRAIL_ATR = 1.5;             // بعد از TP1، استاپ با فاصله‌ی ۱.۵ ATR از بهترین قیمت دنبال می‌شود (فقط به نفع معامله حرکت می‌کند)
+const FUNDING_LIMIT = 0.05;        // فاندینگ بالاتر از +0.05٪ = Long شلوغ؛ پایین‌تر از -0.05٪ = Short شلوغ → ورود ممنوع
+const BLOCK_SAME_DIRECTION_STACK = true; // دو پوزیشن هم‌جهت همزمان نباز (ارزها همبسته‌اند و ریسک عملاً دو برابر می‌شود)
+const LONG_RSI_BAND = [40, 62];    // RSI پولبک سالم برای Long (نه اشباع، نه ضعف)
+const SHORT_RSI_BAND = [38, 60];   // RSI پولبک سالم برای Short
+const POS_TTL_SEC = 7200;          // TTL پوزیشن در KV (بیشتر از Time-Stop تا پوزیشن بی‌صدا حذف نشود)
 
 const BROWSER_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -36,7 +56,7 @@ export default {
       ]);
       return new Response(JSON.stringify({
         ok: true,
-        version: "4.0 Sniper Anti-Stop-Hunt Edition",
+        version: "5.0 Trend-Pullback (1H filter + trailing + honest stats)",
         config,
         livePrices: prices,
         macro
@@ -203,15 +223,32 @@ async function checkActivePositionsRealTime(env) {
     const dec = pos.entry > 100 ? 2 : 3;
     const durationMin = Math.max(1, Math.round((Date.now() - (pos.openedAt || Date.now())) / 60000));
 
-    // ۱. بررسی برخورد با حد ضرر (یا نقطه ریسک‌فری)
-    const slHit = isLong ? currentPrice <= pos.sl : currentPrice >= pos.sl;
+    // بازه‌ی قیمتی (High/Low کندل‌های ۱ دقیقه‌ای) از آخرین بررسی: شدوهای بین دو پولینگ هم دیده می‌شوند،
+    // همان‌طور که استاپ واقعی صرافی با شدو فعال می‌شود. از کندل ورود به بعد شروع می‌شود تا شدوی قبل از ورود حساب نشود.
+    const rangeFrom = pos.rangeFrom || (Math.floor((pos.openedAt || Date.now()) / 60000) + 1) * 60000;
+    const range = await fetchRecentRange(symbol, rangeFrom);
+    const lo = Math.min(currentPrice, range ? range.low : currentPrice);
+    const hi = Math.max(currentPrice, range ? range.high : currentPrice);
+    const worstPrice = isLong ? lo : hi;  // بدترین قیمت در بازه
+    const bestPrice = isLong ? hi : lo;   // بهترین قیمت در بازه
+    const nextMinute = (Math.floor(Date.now() / 60000) + 1) * 60000;
+
+    // ۱. بررسی برخورد با حد ضرر (یا نقطه ریسک‌فری). اگر در یک بازه هم استاپ و هم تارگت لمس شده باشد، محافظه‌کارانه استاپ حساب می‌شود.
+    const slHit = isLong ? worstPrice <= pos.sl : worstPrice >= pos.sl;
     if (slHit) {
+      const realized = realizedPct(pos, pos.sl);
       if (pos.tp1Hit) {
+        await recordTradeStat(env, {
+          signalId: pos.signalId, symbol, direction: pos.direction,
+          result: pos.tp2Hit ? "TP2 + استاپ در TP1 🔥" : "TP1 + ریسک‌فری ✅",
+          pct: realized, riskPct: pos.riskPct
+        });
         const msg = `
 🛡️ <b>خروج امن در ریسک‌فری (Break-Even)</b>
 <blockquote>🔖 <b>سیگنال:</b> <code>${sigTag}</code> | <b>#${symbol}</b> (${pos.direction})
 ├ <b>نقطه خروج:</b> <code>${pos.sl}</code>
 ├ <b>وضعیت قبلی:</b> تارگت ۱ قبلاً با سود بسته شده ✅
+├ <b>نتیجه ترکیبی (${Math.round(TP1_SCALE_OUT * 100)}٪ در TP1):</b> <b>${realized >= 0 ? "+" : ""}${realized.toFixed(2)}%</b>
 └ <b>مدت معامله:</b> ${durationMin} دقیقه</blockquote>
 `.trim();
         await sendTelegramGlobal(env, msg, null, replyMsgId);
@@ -219,7 +256,8 @@ async function checkActivePositionsRealTime(env) {
         const lossPct = (Math.abs(pos.entry - pos.sl) / pos.entry * 100).toFixed(2);
         const levLoss = (lossPct * (pos.leverage || 5)).toFixed(1);
         await recordTradeStat(env, {
-          signalId: pos.signalId, symbol, direction: pos.direction, result: "SL 🛑", pct: -parseFloat(lossPct)
+          signalId: pos.signalId, symbol, direction: pos.direction, result: "SL 🛑",
+          pct: -parseFloat(lossPct), riskPct: pos.riskPct
         });
         const msg = `
 🛑 <b>برخورد با حد ضرر ساختاری (Stop-Loss)</b>
@@ -236,15 +274,15 @@ async function checkActivePositionsRealTime(env) {
     }
 
     // ۲. بررسی برخورد با تارگت سوم (TP3 - فول تارگت)
-    const tp3Hit = isLong ? currentPrice >= pos.tp3 : currentPrice <= pos.tp3;
+    const tp3Hit = isLong ? bestPrice >= pos.tp3 : bestPrice <= pos.tp3;
     if (tp3Hit) {
       const profitPct = (Math.abs(pos.tp3 - pos.entry) / pos.entry * 100).toFixed(2);
       const levProfit = (profitPct * (pos.leverage || 5)).toFixed(1);
-      if (!pos.tp1Hit) {
-        await recordTradeStat(env, {
-          signalId: pos.signalId, symbol, direction: pos.direction, result: "TP3 🚀", pct: parseFloat(profitPct)
-        });
-      }
+      const realized = realizedPct({ ...pos, tp1Hit: true }, pos.tp3);
+      await recordTradeStat(env, {
+        signalId: pos.signalId, symbol, direction: pos.direction, result: "TP3 🚀",
+        pct: realized, riskPct: pos.riskPct
+      });
       const msg = `
 🚀💎 <b>فول تارگت نهایی (TP3 Hit!)</b>
 <blockquote>🔖 <b>سیگنال:</b> <code>${sigTag}</code> | <b>#${symbol}</b> (${pos.direction})
@@ -260,20 +298,14 @@ async function checkActivePositionsRealTime(env) {
     }
 
     // ۳. بررسی برخورد با تارگت دوم (TP2)
-    const tp2Hit = isLong ? currentPrice >= pos.tp2 : currentPrice <= pos.tp2;
+    const tp2Hit = isLong ? bestPrice >= pos.tp2 : bestPrice <= pos.tp2;
     if (tp2Hit && !pos.tp2Hit) {
       pos.tp2Hit = true;
-      const wasCounted = pos.tp1Hit;
       pos.tp1Hit = true;
-      pos.sl = pos.tp1; // قفل سود روی TP1
+      pos.sl = isLong ? Math.max(pos.sl, pos.tp1) : Math.min(pos.sl, pos.tp1); // قفل سود روی TP1 (هرگز پایین‌تر از استاپ تریل‌شده نمی‌آید)
+      pos.rangeFrom = nextMinute;
       const profitPct = (Math.abs(pos.tp2 - pos.entry) / pos.entry * 100).toFixed(2);
       const levProfit = (profitPct * (pos.leverage || 5)).toFixed(1);
-
-      if (!wasCounted) {
-        await recordTradeStat(env, {
-          signalId: pos.signalId, symbol, direction: pos.direction, result: "TP2 🔥", pct: parseFloat(profitPct)
-        });
-      }
 
       const msg = `
 🎯🔥 <b>تارگت دوم تاچ شد (TP2 Hit!)</b>
@@ -285,24 +317,22 @@ async function checkActivePositionsRealTime(env) {
 🛡️ <b>قفل سود:</b> حد ضرر خودکار به <b>TP1 (<code>${pos.tp1}</code>)</b> منتقل شد.
 `.trim();
       await sendTelegramGlobal(env, msg, null, replyMsgId);
-      await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(pos), { expirationTtl: 3000 });
+      await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(pos), { expirationTtl: POS_TTL_SEC });
       activeCount++;
       continue;
     }
 
     // ۴. بررسی برخورد با تارگت اول امن (Safe TP1)
-    const tp1Hit = isLong ? currentPrice >= pos.tp1 : currentPrice <= pos.tp1;
+    const tp1Hit = isLong ? bestPrice >= pos.tp1 : bestPrice <= pos.tp1;
     if (tp1Hit && !pos.tp1Hit) {
       pos.tp1Hit = true;
+      pos.rangeFrom = nextMinute;
       // انتقال استاپ به نقطه ورود با یک بافر کوچک در سود تا کارمزد صرافی هم پوشش داده شود
       const feeBuffer = (pos.tp1 - pos.entry) * 0.12;
       pos.sl = parseFloat((pos.entry + feeBuffer).toFixed(dec));
 
       const profitPct = (Math.abs(pos.tp1 - pos.entry) / pos.entry * 100).toFixed(2);
       const levProfit = (profitPct * (pos.leverage || 5)).toFixed(1);
-      await recordTradeStat(env, {
-        signalId: pos.signalId, symbol, direction: pos.direction, result: "TP1 ✅", pct: parseFloat(profitPct)
-      });
 
       const msg = `
 ✅⚡️ <b>تارگت اول تاچ شد (Safe TP1)</b>
@@ -311,17 +341,33 @@ async function checkActivePositionsRealTime(env) {
 ├ <b>قیمت فعلی:</b> <code>${currentPrice.toFixed(dec)}</code>
 ├ <b>سود فعلی:</b> <b>+${profitPct}%</b> <i>(با اهرم ${pos.leverage}x: <b>+${levProfit}%</b>)</i>
 └ <b>مدت زمان:</b> ${durationMin} دقیقه</blockquote>
-🛡️ <b>ریسک‌فری کامل (+کارمزد):</b> ۶۰٪ سیو سود کنید؛ استاپ به <code>${pos.sl}</code> منتقل شد.
+🛡️ <b>ریسک‌فری کامل (+کارمزد):</b> ${Math.round(TP1_SCALE_OUT * 100)}٪ سیو سود کنید؛ استاپ به <code>${pos.sl}</code> منتقل شد.
 `.trim();
       await sendTelegramGlobal(env, msg, null, replyMsgId);
-      await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(pos), { expirationTtl: 3000 });
+      await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(pos), { expirationTtl: POS_TTL_SEC });
       activeCount++;
       continue;
     }
 
-    // ۵. خروج هوشمند زمانی (Time-Stop بعد از ۷۵ دقیقه)
+    // ۴.۵ (v5) تریلینگ استاپ بعد از TP1: استاپ پشت بهترین قیمت می‌چسبد و فقط به نفع معامله جابه‌جا می‌شود
+    if (pos.tp1Hit && pos.atr) {
+      const trail = isLong ? bestPrice - TRAIL_ATR * pos.atr : bestPrice + TRAIL_ATR * pos.atr;
+      const improves = isLong ? trail > pos.sl : trail < pos.sl;
+      const belowMarket = isLong ? trail < currentPrice : trail > currentPrice; // استاپ باید سمت درست قیمت بماند
+      if (improves && belowMarket) {
+        pos.sl = parseFloat(trail.toFixed(dec));
+        await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(pos), { expirationTtl: POS_TTL_SEC });
+      }
+    }
+
+    // ۵. خروج هوشمند زمانی (Time-Stop) — حالا در آمار هم ثبت می‌شود
     if (durationMin >= MAX_TRADE_DURATION_MIN) {
+      const realized = realizedPct(pos, currentPrice);
       const livePnl = (((isLong ? currentPrice - pos.entry : pos.entry - currentPrice) / pos.entry) * 100).toFixed(2);
+      await recordTradeStat(env, {
+        signalId: pos.signalId, symbol, direction: pos.direction, result: "TIME ⏳",
+        pct: realized, riskPct: pos.riskPct
+      });
       const msg = `
 ⏳ <b>انقضای زمان اسکلپ (Time-Stop)</b>
 <blockquote>🔖 <b>سیگنال:</b> <code>${sigTag}</code> | <b>#${symbol}</b> (${pos.direction})
@@ -339,6 +385,15 @@ async function checkActivePositionsRealTime(env) {
   return activeCount;
 }
 
+// نتیجه‌ی واقعی معامله (٪ از قیمت ورود): اگر TP1 خورده باشد، TP1_SCALE_OUT از پوزیشن در TP1 بسته شده و بقیه در قیمت خروج
+function realizedPct(pos, exitPrice) {
+  const sign = pos.direction === "LONG" ? 1 : -1;
+  const exitPct = sign * (exitPrice - pos.entry) / pos.entry * 100;
+  if (!pos.tp1Hit) return exitPct;
+  const tp1Pct = sign * (pos.tp1 - pos.entry) / pos.entry * 100;
+  return TP1_SCALE_OUT * tp1Pct + (1 - TP1_SCALE_OUT) * exitPct;
+}
+
 /* =========================================================
    ۴. موتور اسکن ضد استاپ (v4.0 Sniper Anti-Stop-Hunt Engine)
 ========================================================= */
@@ -348,12 +403,24 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
     let activePositions = await checkActivePositionsRealTime(env);
     if (!forceBest && activePositions >= config.maxPositions) return;
 
+    // مکث بعد از ضررهای پشت‌سرهم (محافظ سرمایه در بازار نامناسب)
+    if (!forceBest && env.SIGNAL_KV && await env.SIGNAL_KV.get("PAUSE_UNTIL")) return;
+
     const [macroData, btcLeader] = await Promise.all([
       fetchMacroData(),
       analyzeBTCLeader()
     ]);
 
     let bestCandidate = null;
+
+    // جهت پوزیشن‌های باز (برای جلوگیری از انباشت ریسک هم‌جهت)
+    const openDirs = [];
+    if (env.SIGNAL_KV) {
+      for (const sym of SYMBOLS) {
+        const rawPos = await env.SIGNAL_KV.get(`POS_${sym}`);
+        if (rawPos) { try { openDirs.push(JSON.parse(rawPos).direction); } catch {} }
+      }
+    }
 
     for (const symbol of SYMBOLS) {
       if (!forceBest && activePositions >= config.maxPositions) break;
@@ -364,27 +431,23 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
         if (existingPos || cooldown) continue;
       }
 
-      const coin = symbol.replace("USDT", "");
-      const [klines5m, klines15m, futuresData] = await Promise.all([
-        fetchKlines(symbol, "5m", 120),
-        fetchKlines(symbol, "15m", 120),
-        fetchOKXFuturesData(coin)
-      ]);
+      const { klines5m, klines15m, klines1h, futuresData } = await fetchSymbolData(env, symbol);
       if (klines5m.length < 70 || klines15m.length < 70) continue;
 
       const tf5m = analyzeSniperIndicators(klines5m, 10, 2.5); // سوپرترند پایدارتر (10, 2.5) برای حذف نویز
       const tf15m = analyzeSniperIndicators(klines15m, 10, 3.0);
+      const tf1h = klines1h.length >= 70 ? analyzeSniperIndicators(klines1h, 10, 3.0) : null;
 
       // تعیین جهت بر اساس ساختار ۱۵ دقیقه + ستاپ اسنایپر ۵ دقیقه
       let direction = tf5m.setupDirection || tf15m.supertrend.direction;
 
-      const news = await fetchNewsSentiment(coin, env.CRYPTOPANIC_API_KEY);
+      // (فراخوانی fetchNewsSentiment حذف شد: نتیجه‌اش در امتیازدهی استفاده نمی‌شد و فقط تأخیر و درخواست اضافه بود)
       const scoreData = evaluateSniperScore({
-        symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news
+        symbol, direction, tf5m, tf15m, tf1h, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
       });
 
       const candidate = {
-        symbol, direction, entry: tf5m.close, tf5m, tf15m, btcLeader, futuresData, scoreData, macroData
+        symbol, direction, entry: tf5m.close, tf5m, tf15m, tf1h, btcLeader, futuresData, scoreData, macroData
       };
 
       if (!bestCandidate || scoreData.score > bestCandidate.scoreData.score) {
@@ -397,6 +460,13 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
       // ۳. در اشباع خرید/فروش نباشد (!scoreData.rsiExhausted)
       // ۴. هم‌جهت با تایم ۱۵ دقیقه و رهبر بازار (BTC) باشد
       // ۵. حتماً یکی از ۳ ستاپ اسنایپر (پولبک، جمع‌آوری نقدینگی، یا شکست تاییدشده) روی کندل بسته‌شده رخ داده باشد
+      // ۶. (v4.1) هم‌جهت با روند ۱ ساعته باشد
+      // ۷. (v4.1) استاپ ساختاری باید در محدوده‌ی منطقی باشد (به‌جای فشرده‌کردن استاپ داخل ساختار، سیگنال حذف می‌شود)
+      // ۸. (v4.1) قیمت زنده بیش از ۰.۶ ATR از کلوز کندل سیگنال در جهت معامله فرار نکرده باشد (ضد Chase)
+      const probeTargets = calculateStructuralTargets(tf5m, direction);
+      const chaseAtr = direction === "LONG"
+        ? (tf5m.close - tf5m.closedPrice) / (tf5m.atr || 1)
+        : (tf5m.closedPrice - tf5m.close) / (tf5m.atr || 1);
       if (
         !forceBest &&
         !tf5m.isRanging &&
@@ -404,11 +474,16 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
         !scoreData.rsiExhausted &&
         scoreData.btcAligned &&
         scoreData.mtfAligned &&
+        scoreData.h1Aligned &&
+        !scoreData.fundingBlocked &&
+        !(BLOCK_SAME_DIRECTION_STACK && openDirs.includes(direction)) &&
+        !probeTargets.structureInvalid &&
+        chaseAtr <= MAX_CHASE_ATR &&
         tf5m.hasSniperTrigger &&
         scoreData.score >= config.minScore
       ) {
         const signalId = await getNextSignalId(env);
-        const targets = calculateStructuralTargets(tf5m, direction);
+        const targets = probeTargets;
         const sentMsgId = await sendProSignalMessage(env, { ...candidate, targets, signalId }, customChatId);
 
         if (env.SIGNAL_KV) {
@@ -422,16 +497,19 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
             tp2: parseFloat(targets.tp2),
             tp3: parseFloat(targets.tp3),
             sl: parseFloat(targets.sl),
+            riskPct: parseFloat(targets.slPct),
+            atr: targets.atr,
             leverage: targets.leverage,
             tp1Hit: false,
             tp2Hit: false,
             openedAt: Date.now()
           };
-          await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(posState), { expirationTtl: 4800 });
+          await env.SIGNAL_KV.put(`POS_${symbol}`, JSON.stringify(posState), { expirationTtl: POS_TTL_SEC });
           // ایجاد ۲۰ دقیقه Cooldown برای جلوگیری از سیگنال‌های پشت سر هم روی یک ارز
           await env.SIGNAL_KV.put(`COOLDOWN_${symbol}`, "1", { expirationTtl: 1200 });
         }
         activePositions++;
+        openDirs.push(direction);
       }
     }
 
@@ -457,12 +535,14 @@ async function runBotEngine(env, forceBest = false, customChatId = null) {
             tp2: parseFloat(targets.tp2),
             tp3: parseFloat(targets.tp3),
             sl: parseFloat(targets.sl),
+            riskPct: parseFloat(targets.slPct),
+            atr: targets.atr,
             leverage: targets.leverage,
             tp1Hit: false,
             tp2Hit: false,
             openedAt: Date.now()
           };
-          await env.SIGNAL_KV.put(`POS_${bestCandidate.symbol}`, JSON.stringify(posState), { expirationTtl: 4800 });
+          await env.SIGNAL_KV.put(`POS_${bestCandidate.symbol}`, JSON.stringify(posState), { expirationTtl: POS_TTL_SEC });
         }
       }
     }
@@ -494,6 +574,8 @@ function analyzeSniperIndicators(klines, stPeriod = 10, stMult = 2.5) {
 
   const atr = calcATR(closedKlines, 14);
   const adx = calcADX(closedKlines, 14);
+  const adx3 = calcADX(closedKlines.slice(0, -3), 14);
+  const adxNotFalling = adx >= adx3 - 0.5; // قدرت روند در حال ضعیف‌شدن نباشد
   const vwap = calcVWAP(closedKlines.slice(-48));
   const bb = calcBollingerBands(closes, 20, 2);
   const supertrend = calcSupertrend(closedKlines, stPeriod, stMult);
@@ -513,12 +595,17 @@ function analyzeSniperIndicators(klines, stPeriod = 10, stMult = 2.5) {
   const priorHigh = Math.max(...prior10.map(k => k.high));
 
   // Bullish Sweep: کندل به زیر کف قبلی شدو زده (استاپ‌ها را جمع کرده) ولی بالای آن و سبز بسته شده!
-  const bullishSweep = (closed.low < priorLow || prevClosed.low < priorLow) &&
+  // v4.1: یا خود کندل تایید شدو زده، یا کندل قبلی شدو زده و کندل فعلی با بستن بالاتر از High آن تایید کرده
+  const sweptLowNow = closed.low < priorLow;
+  const sweptLowPrev = prevClosed.low < priorLow && closed.close > prevClosed.high;
+  const bullishSweep = (sweptLowNow || sweptLowPrev) &&
                        closed.close > priorLow &&
                        closed.close > closed.open;
 
   // Bearish Sweep: کندل به بالای سقف قبلی شدو زده ولی زیر آن و قرمز بسته شده!
-  const bearishSweep = (closed.high > priorHigh || prevClosed.high > priorHigh) &&
+  const sweptHighNow = closed.high > priorHigh;
+  const sweptHighPrev = prevClosed.high > priorHigh && closed.close < prevClosed.low;
+  const bearishSweep = (sweptHighNow || sweptHighPrev) &&
                        closed.close < priorHigh &&
                        closed.close < closed.open;
 
@@ -531,6 +618,8 @@ function analyzeSniperIndicators(klines, stPeriod = 10, stMult = 2.5) {
 
   const bullishPullbackBounce =
     supertrend.direction === "LONG" &&
+    ema20 > ema50 && // v4.1: ساختار صعودی واقعی، نه فقط سوپرترند
+    adxNotFalling && rsi >= LONG_RSI_BAND[0] && rsi <= LONG_RSI_BAND[1] && // v5: پولبک سالم
     touchedBullSupport &&
     closed.close > ema9 &&
     closed.close > closed.open && // کندل تایید حتماً سبز بسته شده باشد
@@ -544,6 +633,8 @@ function analyzeSniperIndicators(klines, stPeriod = 10, stMult = 2.5) {
 
   const bearishPullbackBounce =
     supertrend.direction === "SHORT" &&
+    ema20 < ema50 && // v4.1: ساختار نزولی واقعی
+    adxNotFalling && rsi >= SHORT_RSI_BAND[0] && rsi <= SHORT_RSI_BAND[1] && // v5: پولبک سالم
     touchedBearResistance &&
     closed.close < ema9 &&
     closed.close < closed.open && // کندل تایید حتماً قرمز بسته شده باشد
@@ -553,7 +644,7 @@ function analyzeSniperIndicators(klines, stPeriod = 10, stMult = 2.5) {
   const volRatio = closed.volume / (avgVol || 1);
 
   // ۴. فیلتر بازار رنج و نوسان فرسایشی
-  const isRanging = (adx < 20 && bb.bandwidth < 0.0050) || bb.bandwidth < 0.0032;
+  const isRanging = adx < MIN_ADX_5M || bb.bandwidth < 0.0032;
 
   // ۵. فیلتر سخت‌گیرانه ضد هیجان (Anti-Chase Filter)
   const extensionAtr = Math.abs(liveCandle.close - ema20) / (atr || 1);
@@ -565,11 +656,11 @@ function analyzeSniperIndicators(klines, stPeriod = 10, stMult = 2.5) {
   let setupType = "ندارد (منتظر پولبک/شکست)";
   let setupDirection = supertrend.direction;
 
-  if (bullishSweep && (divergence.bullish || closed.close > vwap)) {
+  if (bullishSweep && volRatio >= SWEEP_MIN_VOL_RATIO && (divergence.bullish || closed.close > vwap)) {
     hasSniperTrigger = true;
     setupType = "🧲 شکار نقدینگی کف (Bullish Liquidity Sweep)";
     setupDirection = "LONG";
-  } else if (bearishSweep && (divergence.bearish || closed.close < vwap)) {
+  } else if (bearishSweep && volRatio >= SWEEP_MIN_VOL_RATIO && (divergence.bearish || closed.close < vwap)) {
     hasSniperTrigger = true;
     setupType = "🧲 شکار نقدینگی سقف (Bearish Liquidity Sweep)";
     setupDirection = "SHORT";
@@ -613,30 +704,36 @@ function calculateStructuralTargets(tf5m, direction) {
   const m = isLong ? 1 : -1;
 
   // ۱. پیدا کردن نقطه امن ساختاری برای استاپ (پشت Swing Low/High یا پشت Order Block + بافر 0.45x ATR)
+  // v4.1: Order Block فقط وقتی در محاسبه‌ی استاپ وارد می‌شود که قیمت واقعاً داخل همان OB پولبک زده باشد
+  // (قبلاً یک OB دور و قدیمی هم می‌توانست استاپ را بی‌دلیل خیلی دور ببرد)
   let structuralSL;
   if (isLong) {
-    const obBottom = tf5m.orderBlock.bullOB ? tf5m.orderBlock.bullOB.bottom : tf5m.swingLow;
-    const baseSupport = Math.min(tf5m.swingLow, obBottom);
+    const ob = tf5m.orderBlock;
+    const baseSupport = (ob.inBullishOB && ob.bullOB) ? Math.min(tf5m.swingLow, ob.bullOB.bottom) : tf5m.swingLow;
     structuralSL = baseSupport - (atr * 0.45); // قرارگیری استاپ زیر شدوی کف قبلی
   } else {
-    const obTop = tf5m.orderBlock.bearOB ? tf5m.orderBlock.bearOB.top : tf5m.swingHigh;
-    const baseResistance = Math.max(tf5m.swingHigh, obTop);
+    const ob = tf5m.orderBlock;
+    const baseResistance = (ob.inBearishOB && ob.bearOB) ? Math.max(tf5m.swingHigh, ob.bearOB.top) : tf5m.swingHigh;
     structuralSL = baseResistance + (atr * 0.45); // قرارگیری استاپ بالای شدوی سقف قبلی
   }
 
-  // محدود کردن فاصله استاپ بین حداقل 1.35x ATR (که با نویز نخورد) و حداکثر 2.3x ATR (که ریسک زیاد نشود)
+  // v4.1: استاپ را دیگر «داخل ساختار» فشرده نمی‌کنیم (همان جایی که استاپ‌هانت می‌شود).
+  // اگر ساختار خیلی دور باشد یا قیمت از قبل ساختار را شکسته باشد، سیگنال رد می‌شود (structureInvalid).
+  // فقط در جهت «دورتر کردن» (حداقل 1.35 ATR برای عدم برخورد با نویز) تغییر اعمال می‌شود.
   let riskDist = Math.abs(price - structuralSL);
-  const minRisk = atr * 1.35;
-  const maxRisk = atr * 2.30;
+  const minRisk = atr * MIN_SL_ATR;
+  const maxRisk = atr * MAX_STRUCT_SL_ATR;
+  const structureBroken = isLong ? price <= structuralSL : price >= structuralSL;
+  const structureInvalid = structureBroken || riskDist > maxRisk;
   if (riskDist < minRisk) riskDist = minRisk;
-  if (riskDist > maxRisk) riskDist = maxRisk;
+  if (riskDist > maxRisk) riskDist = maxRisk; // فقط برای نمایش در /force و کالبدشکافی؛ سیگنال خودکار در این حالت ارسال نمی‌شود
 
   const slPrice = price - m * riskDist;
 
   // ۲. تارگت اول بسیار امن و در دسترس (0.75 برابر فاصله استاپ) برای ریسک‌فری سریع
-  const tp1Price = price + m * (riskDist * 0.75);
-  const tp2Price = price + m * (riskDist * 1.50);
-  const tp3Price = price + m * (riskDist * 2.50);
+  const tp1Price = price + m * (riskDist * TP1_R);
+  const tp2Price = price + m * (riskDist * TP2_R);
+  const tp3Price = price + m * (riskDist * TP3_R);
 
   const zoneLow = (price - m * (atr * 0.25)).toFixed(dec);
   const zoneHigh = price.toFixed(dec);
@@ -659,19 +756,27 @@ function calculateStructuralTargets(tf5m, direction) {
     tp2: tp2Price.toFixed(dec),
     tp3: tp3Price.toFixed(dec),
     slPct, tp1Pct, tp2Pct, tp3Pct,
-    leverage, marginPct
+    leverage, marginPct,
+    structureInvalid,
+    atr
   };
 }
 
 /* =========================================================
    ۷. امتیازدهی سخت‌گیرانه ضد استاپ (Sniper Scoring v4.0)
 ========================================================= */
-function evaluateSniperScore({ symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news }) {
+function evaluateSniperScore({ symbol, direction, tf5m, tf15m, tf1h, btcLeader, futuresData, macroData, news }) {
   let score = 0;
   let reasons = [];
 
   // ۱. بررسی اشباع RSI (مسدودکننده خرید در سقف و فروش در کف!)
   const rsiExhausted = (direction === "LONG" && tf5m.rsi > 64) || (direction === "SHORT" && tf5m.rsi < 36);
+
+  // ۱.۵ (v4.1) فیلتر روند ۱ ساعته: اگر داده‌ی ۱H موجود نباشد، فیلتر «بسته» عمل می‌کند و سیگنالی ارسال نمی‌شود
+  const h1Aligned = !REQUIRE_1H_TREND || Boolean(tf1h && (
+    (direction === "LONG" && tf1h.supertrend.direction === "LONG" && tf1h.closedPrice >= tf1h.ema50) ||
+    (direction === "SHORT" && tf1h.supertrend.direction === "SHORT" && tf1h.closedPrice <= tf1h.ema50)
+  ));
 
   // ۲. هم‌جهتی کامل تایم ۵ دقیقه با ساختار ۱۵ دقیقه و روند ماکرو (۲۰ امتیاز)
   const mtfAligned =
@@ -750,12 +855,16 @@ function evaluateSniperScore({ symbol, direction, tf5m, tf15m, btcLeader, future
     score -= 10; // جریمه سنگین برای اشباع خرید/فروش
   }
 
+  // v5: فاندینگ افراطی = ازدحام در یک سمت بازار (ریسک Squeeze)
+  const fundingBlocked = (direction === "LONG" && futuresData.fundingRate > FUNDING_LIMIT) ||
+                         (direction === "SHORT" && futuresData.fundingRate < -FUNDING_LIMIT);
+
   let grade = "رد شده ⏳";
   if (score >= 86) grade = "Sniper VIP A+ 💎";
   else if (score >= 80) grade = "Sniper Grade A 🔥";
   else if (score >= 74) grade = "Grade B+ ⚡️";
 
-  return { score: Math.max(0, Math.min(100, score)), grade, reasons, btcAligned, mtfAligned, rsiExhausted };
+  return { score: Math.max(0, Math.min(100, score)), grade, reasons, btcAligned, mtfAligned, h1Aligned, rsiExhausted, fundingBlocked };
 }
 
 /* =========================================================
@@ -869,12 +978,7 @@ async function handleScanCommand(env, chatId) {
     let blocks = [];
 
     for (const symbol of SYMBOLS) {
-      const coin = symbol.replace("USDT", "");
-      const [klines5m, klines15m, futuresData] = await Promise.all([
-        fetchKlines(symbol, "5m", 120),
-        fetchKlines(symbol, "15m", 120),
-        fetchOKXFuturesData(coin)
-      ]);
+      const { klines5m, klines15m, klines1h, futuresData } = await fetchSymbolData(env, symbol);
 
       if (klines5m.length < 70 || klines15m.length < 70) {
         blocks.push(`🔸 <b>#${symbol}</b>: ⚠️ خطا در دریافت کندل`);
@@ -883,10 +987,12 @@ async function handleScanCommand(env, chatId) {
 
       const tf5m = analyzeSniperIndicators(klines5m, 10, 2.5);
       const tf15m = analyzeSniperIndicators(klines15m, 10, 3.0);
+      const tf1h = klines1h.length >= 70 ? analyzeSniperIndicators(klines1h, 10, 3.0) : null;
       const direction = tf5m.setupDirection || tf15m.supertrend.direction;
       const scoreData = evaluateSniperScore({
-        symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
+        symbol, direction, tf5m, tf15m, tf1h, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
       });
+      const scanTargets = calculateStructuralTargets(tf5m, direction);
 
       const dirIcon = direction === "LONG" ? "🟢 LONG" : "🔴 SHORT";
       let stateText = "⏳ منتظر پولبک به EMA20/VWAP";
@@ -895,6 +1001,9 @@ async function handleScanCommand(env, chatId) {
       else if (tf5m.isOverextended) stateText = "🚫 کندل کشیده (صبر برای اصلاح)";
       else if (!scoreData.btcAligned) stateText = "🚫 خلاف جهت BTC";
       else if (!scoreData.mtfAligned) stateText = "⏳ عدم هماهنگی 5m با 15m";
+      else if (!scoreData.h1Aligned) stateText = "🚫 خلاف روند 1H";
+      else if (scoreData.fundingBlocked) stateText = "🚫 فاندینگ افراطی (ازدحام)";
+      else if (scanTargets.structureInvalid) stateText = "🚫 استاپ ساختاری نامناسب (خیلی دور / ساختار شکسته)";
       else if (tf5m.hasSniperTrigger && scoreData.score >= config.minScore) stateText = "🎯 <b>ستاپ اسنایپر آماده!</b>";
 
       blocks.push(
@@ -989,13 +1098,10 @@ ${posText}
 }
 
 async function handleSingleCoinCommand(env, chatId, symbol) {
-  const coin = symbol.replace("USDT", "");
-  const [klines5m, klines15m, macroData, btcLeader, futuresData, config] = await Promise.all([
-    fetchKlines(symbol, "5m", 120),
-    fetchKlines(symbol, "15m", 120),
+  const [{ klines5m, klines15m, klines1h, futuresData }, macroData, btcLeader, config] = await Promise.all([
+    fetchSymbolData(env, symbol),
     fetchMacroData(),
     analyzeBTCLeader(),
-    fetchOKXFuturesData(coin),
     getBotConfig(env)
   ]);
 
@@ -1006,9 +1112,10 @@ async function handleSingleCoinCommand(env, chatId, symbol) {
 
   const tf5m = analyzeSniperIndicators(klines5m, 10, 2.5);
   const tf15m = analyzeSniperIndicators(klines15m, 10, 3.0);
+  const tf1h = klines1h.length >= 70 ? analyzeSniperIndicators(klines1h, 10, 3.0) : null;
   const direction = tf5m.setupDirection || tf15m.supertrend.direction;
   const scoreData = evaluateSniperScore({
-    symbol, direction, tf5m, tf15m, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
+    symbol, direction, tf5m, tf15m, tf1h, btcLeader, futuresData, macroData, news: { bias: "NEUTRAL" }
   });
   const targets = calculateStructuralTargets(tf5m, direction);
   const dec = tf5m.close > 100 ? 2 : 3;
@@ -1022,6 +1129,8 @@ async function handleSingleCoinCommand(env, chatId, symbol) {
 🛡️ <b>فیلترهای محافظ سرمایه</b>
 ├ <b>ستاپ ۵ دقیقه:</b> ${tf5m.setupType}
 ├ <b>هماهنگی 5m و 15m:</b> ${scoreData.mtfAligned ? "✅ هم‌جهت" : "🚫 ناهماهنگ"}
+├ <b>روند 1H:</b> ${scoreData.h1Aligned ? "✅ هم‌جهت" : "🚫 خلاف روند ساعتی"}
+├ <b>استاپ ساختاری:</b> ${targets.structureInvalid ? "🚫 نامناسب (خیلی دور / ساختار شکسته)" : "✅ در محدوده"}
 ├ <b>هم‌جهتی با BTC:</b> ${scoreData.btcAligned ? "✅ تایید شده" : "🚫 خلاف جهت بیت‌کوین"}
 ├ <b>اشباع RSI:</b> ${scoreData.rsiExhausted ? "🚫 در منطقه اشباع (ورود ممنوع)" : `✅ استاندارد (${tf5m.rsi.toFixed(1)})`}
 └ <b>سقف و کف ساختاری:</b> کف <code>${tf5m.swingLow.toFixed(dec)}</code> | سقف <code>${tf5m.swingHigh.toFixed(dec)}</code>
@@ -1076,19 +1185,21 @@ async function handleHistoryCommand(env, chatId) {
 }
 
 async function handleStatsCommand(env, chatId) {
-  let stats = { wins: 0, losses: 0, netPct: 0 };
+  let stats = { wins: 0, losses: 0, netPct: 0, sumR: 0 };
   if (env.SIGNAL_KV) {
     const raw = await env.SIGNAL_KV.get("BOT_STATS");
-    if (raw) { try { stats = JSON.parse(raw); } catch {} }
+    if (raw) { try { stats = { ...stats, ...JSON.parse(raw) }; } catch {} }
   }
   const total = stats.wins + stats.losses;
   const winRate = total > 0 ? ((stats.wins / total) * 100).toFixed(1) : "0.0";
+  const avgR = total > 0 ? (stats.sumR / total).toFixed(2) : "0.00";
 
   const text = `
 📈 <b>کارنامه و آمار عملکرد بات</b>
 <blockquote>├ ✅ <b>تارگت‌های موفق (Wins):</b> ${stats.wins}
 ├ 🛑 <b>استاپ‌ها (Losses):</b> ${stats.losses}
 ├ 🏆 <b>نرخ برد (Win-Rate):</b> <b>${winRate}%</b>
+├ 📐 <b>میانگین نتیجه هر معامله (Expectancy):</b> <b>${avgR >= 0 ? "+" : ""}${avgR}R</b>
 └ 💰 <b>برآیند خالص (بدون اهرم):</b> <b>${stats.netPct >= 0 ? "+" : ""}${stats.netPct.toFixed(2)}%</b></blockquote>
 `.trim();
 
@@ -1139,14 +1250,27 @@ ${banner}⚙️ <b>تنظیمات زنده بات (نسخه ضد استاپ v4.0
 
 async function recordTradeStat(env, tradeInfo) {
   if (!env.SIGNAL_KV) return;
-  const { signalId, symbol, direction, result, pct } = tradeInfo;
+  const { signalId, symbol, direction, result, pct, riskPct } = tradeInfo;
 
-  let stats = { wins: 0, losses: 0, netPct: 0 };
+  let stats = { wins: 0, losses: 0, netPct: 0, sumR: 0, streak: 0 };
   const rawStats = await env.SIGNAL_KV.get("BOT_STATS");
-  if (rawStats) { try { stats = JSON.parse(rawStats); } catch {} }
-  if (pct >= 0) stats.wins += 1;
-  else stats.losses += 1;
+  if (rawStats) { try { stats = { ...stats, ...JSON.parse(rawStats) }; } catch {} }
+
+  // هر معامله فقط یک‌بار و با نتیجه‌ی نهایی ثبت می‌شود (قبلاً TP1 بلافاصله «برد» ثبت می‌شد و Time-Stop اصلاً ثبت نمی‌شد)
+  const isWin = pct > 0;
+  if (isWin) { stats.wins += 1; stats.streak = 0; }
+  else { stats.losses += 1; stats.streak += 1; }
   stats.netPct += pct;
+  if (riskPct > 0) stats.sumR += pct / riskPct; // نتیجه بر حسب R (۱R = فاصله‌ی استاپ)
+
+  // کول‌داون بعد از ضرر روی همان ارز + مکث کلی بعد از چند ضرر پشت‌سرهم
+  if (!isWin) {
+    await env.SIGNAL_KV.put(`COOLDOWN_${symbol}`, "1", { expirationTtl: LOSS_COOLDOWN_SEC });
+    if (stats.streak >= MAX_LOSS_STREAK) {
+      await env.SIGNAL_KV.put("PAUSE_UNTIL", "1", { expirationTtl: LOSS_PAUSE_SEC });
+      stats.streak = 0;
+    }
+  }
   await env.SIGNAL_KV.put("BOT_STATS", JSON.stringify(stats));
 
   let history = [];
@@ -1182,7 +1306,7 @@ async function analyzeBTCLeader() {
 }
 
 async function fetchOKXFuturesData(coin) {
-  let fundingRate = 0.0001, takerBuyRatio = 50.0, flowBias = "NEUTRAL";
+  let fundingRate = 0, takerBuyRatio = 50.0, flowBias = "NEUTRAL";
   try {
     const [fundRes, takerRes] = await Promise.all([
       fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${coin}-USDT-SWAP`, { headers: BROWSER_HEADERS }),
@@ -1236,10 +1360,60 @@ async function fetchLivePrices() {
   return prices;
 }
 
+const OKX_BARS = { "5m": "5m", "15m": "15m", "1h": "1H" };
+const KUCOIN_TYPES = { "5m": "5min", "15m": "15min", "1h": "1hour" };
+
+// دیتای هر ارز (۵ دقیقه، ۱۵ دقیقه، ۱ ساعت، فیوچرز) در یک تابع
+async function fetchSymbolData(env, symbol) {
+  const coin = symbol.replace("USDT", "");
+  const [klines5m, klines15m, klines1h, futuresData] = await Promise.all([
+    fetchKlines(symbol, "5m", 120),
+    fetchKlines(symbol, "15m", 120),
+    fetchKlines1hCached(env, symbol),
+    fetchOKXFuturesData(coin)
+  ]);
+  return { klines5m, klines15m, klines1h, futuresData };
+}
+
+// کندل ۱ ساعته کند تغییر می‌کند؛ ۱۰ دقیقه در KV کش می‌شود تا تعداد درخواست‌های بیرونی در هر اجرا کم بماند
+async function fetchKlines1hCached(env, symbol) {
+  const key = `KL1H_${symbol}`;
+  if (env.SIGNAL_KV) {
+    try {
+      const cached = await env.SIGNAL_KV.get(key);
+      if (cached) return JSON.parse(cached);
+    } catch {}
+  }
+  const kl = await fetchKlines(symbol, "1h", 120);
+  if (env.SIGNAL_KV && kl.length >= 70) {
+    try { await env.SIGNAL_KV.put(key, JSON.stringify(kl), { expirationTtl: 600 }); } catch {}
+  }
+  return kl;
+}
+
+// High/Low کندل‌های ۱ دقیقه‌ای از زمان sinceTs به بعد (برای تشخیص لمس استاپ/تارگت توسط شدو)
+async function fetchRecentRange(symbol, sinceTs) {
+  const coin = symbol.replace("USDT", "");
+  try {
+    const res = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${coin}-USDT&bar=1m&limit=8`, { headers: BROWSER_HEADERS });
+    if (!res.ok) return null;
+    const json = await res.json();
+    let high = -Infinity, low = Infinity;
+    for (const d of json.data || []) {
+      if (parseInt(d[0], 10) < sinceTs) continue;
+      high = Math.max(high, parseFloat(d[2]));
+      low = Math.min(low, parseFloat(d[3]));
+    }
+    return Number.isFinite(high) && Number.isFinite(low) ? { high, low } : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchKlines(symbol, interval, limit = 100) {
   const coin = symbol.replace("USDT", "");
   try {
-    const okxBar = interval === "5m" ? "5m" : "15m";
+    const okxBar = OKX_BARS[interval] || "15m";
     const res = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${coin}-USDT&bar=${okxBar}&limit=${limit}`, { headers: BROWSER_HEADERS });
     if (res.ok) {
       const json = await res.json();
@@ -1264,7 +1438,7 @@ async function fetchKlines(symbol, interval, limit = 100) {
   } catch (e) {}
 
   try {
-    const kcType = interval === "5m" ? "5min" : "15min";
+    const kcType = KUCOIN_TYPES[interval] || "15min";
     const res = await fetch(`https://api.kucoin.com/api/v1/market/candles?type=${kcType}&symbol=${coin}-USDT`, { headers: BROWSER_HEADERS });
     if (res.ok) {
       const json = await res.json();
@@ -1477,17 +1651,40 @@ function calcATR(klines, period = 14) {
   return sum / period;
 }
 
+// ADX واقعی با هموارسازی Wilder (نسخه‌ی قبلی میانگین ساده‌ی DX تک‌کندلی بود و عدد کاملاً بالا/نویزی می‌داد)
 function calcADX(klines, period = 14) {
-  let dx = [];
-  for (let i = klines.length - period * 2; i < klines.length; i++) {
-    if (i <= 0) continue;
-    const up = klines[i].high - klines[i - 1].high, down = klines[i - 1].low - klines[i].low;
-    const pDM = (up > down && up > 0) ? up : 0, mDM = (down > up && down > 0) ? down : 0;
-    const tr = Math.max(klines[i].high - klines[i].low, Math.abs(klines[i].high - klines[i - 1].close), Math.abs(klines[i].low - klines[i - 1].close)) || 1;
-    const pDI = (pDM / tr) * 100, mDI = (mDM / tr) * 100;
-    dx.push((Math.abs(pDI - mDI) / ((pDI + mDI) || 1)) * 100);
+  const n = klines.length;
+  if (n < period * 2 + 1) return 0;
+  const tr = [], pdm = [], mdm = [];
+  for (let i = 1; i < n; i++) {
+    const up = klines[i].high - klines[i - 1].high;
+    const down = klines[i - 1].low - klines[i].low;
+    pdm.push(up > down && up > 0 ? up : 0);
+    mdm.push(down > up && down > 0 ? down : 0);
+    tr.push(Math.max(
+      klines[i].high - klines[i].low,
+      Math.abs(klines[i].high - klines[i - 1].close),
+      Math.abs(klines[i].low - klines[i - 1].close)
+    ));
   }
-  return dx.slice(-period).reduce((a, b) => a + b, 0) / period;
+  const sum = (arr, a, b) => arr.slice(a, b).reduce((x, y) => x + y, 0);
+  let sTR = sum(tr, 0, period), sP = sum(pdm, 0, period), sM = sum(mdm, 0, period);
+  const dxs = [];
+  const pushDX = () => {
+    const pDI = 100 * sP / (sTR || 1), mDI = 100 * sM / (sTR || 1);
+    dxs.push(100 * Math.abs(pDI - mDI) / ((pDI + mDI) || 1));
+  };
+  pushDX();
+  for (let i = period; i < tr.length; i++) {
+    sTR = sTR - sTR / period + tr[i];
+    sP = sP - sP / period + pdm[i];
+    sM = sM - sM / period + mdm[i];
+    pushDX();
+  }
+  if (dxs.length < period) return dxs.reduce((a, b) => a + b, 0) / dxs.length;
+  let adx = dxs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxs.length; i++) adx = (adx * (period - 1) + dxs[i]) / period;
+  return adx;
 }
 
 async function answerCallback(env, callbackQueryId, text) {
