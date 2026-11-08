@@ -21,15 +21,22 @@
  *   • رفع باگ‌ها: پیام اشتباه «Break-Even» بعد از TP2، شرط TOTAL2 در بازار نزولی، TTL پوزیشن، فیلد undefined در اسکن و ...
  */
 
-const VERSION = "8.1";
+const VERSION = "8.2";
 const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"];
 
 const CONFIG = Object.freeze({
-  MAX_OPEN_POSITIONS: 3,
-  MIN_SCORE: 76,                  // آستانه Grade A
+  MAX_OPEN_POSITIONS: 2,           // ارزها هم‌بسته‌اند؛ ۲ پوزیشن هم‌زمان کافی است
+  MIN_SCORE: 70,                  // امتیازها دیگر «هدیه» نیستند؛ آستانه را با بک‌تست کالیبره کنید
   MAX_TRADE_DURATION_MIN: 1080,   // ۱۸ ساعت
   POSITION_TTL_SEC: 86400,        // بیشتر از مهلت معامله تا Time-Stop همیشه فرصت اجرا داشته باشد
   COOLDOWN_SEC: 7200,
+  COOLDOWN_AFTER_SL_SEC: 21600,   // بعد از استاپ ۶ ساعت روی همان ارز سیگنال نده
+  ADX_MIN: 20,                    // زیر این مقدار = بازار رنج
+  MIN_ATR_PCT: 0.20,              // نوسان ۱H کمتر از ۰.۲٪ = تارگت‌ها به کارمزد می‌خورند
+  MAX_STALE_ATR: 0.5,             // فاصله قیمت لحظه‌ای تا بسته‌شدن کندل ستاپ
+  SL_ATR_MIN: 1.2,
+  SL_ATR_MAX: 2.0,
+  TP_R: [1.0, 2.0, 3.0],          // TP1 / TP2 / TP3 بر حسب R
   MONITOR_TICKS: 3,
   MONITOR_INTERVAL_MS: 15000,
   FETCH_TIMEOUT_MS: 8000,
@@ -487,18 +494,24 @@ async function computeMacro() {
 /* =========================================================
    ۵. تحلیل چارت، امتیازدهی و تارگت‌ها
 ========================================================= */
-/** تحلیل سبک برای تایم ۴ ساعته: فقط روند */
+/** تحلیل سبک برای تایم ۴ ساعته: تشخیص روند (Supertrend + EMA50) */
 function analyzeTrend(klines) {
   const closed = klines.slice(0, -1);
   const closes = closed.map((k) => k.close);
-  return {
-    close: klines.at(-1).close,
-    ema21: calcEMA(closes, 21), ema50: calcEMA(closes, 50), ema200: calcEMA(closes, 200),
-    supertrend: calcSupertrend(closed, 10, 3.0)
-  };
+  const close = klines.at(-1).close;
+  const ema21 = calcEMA(closes, 21), ema50 = calcEMA(closes, 50), ema200 = calcEMA(closes, 200);
+  const supertrend = calcSupertrend(closed, 10, 3.0);
+  const trend =
+    supertrend.direction === "LONG" && close > ema50 ? "LONG" :
+    supertrend.direction === "SHORT" && close < ema50 ? "SHORT" : null;
+  return { close, ema21, ema50, ema200, supertrend, trend };
 }
 
-function analyzeDayTradingChart(klines) {
+/**
+ * تحلیل ۱ ساعته. bias = روند ۴ ساعته؛ فقط ستاپ‌های هم‌جهت با آن بررسی می‌شوند
+ * (معاملات خلاف روند اصلی حذف شده‌اند).
+ */
+function analyzeDayTradingChart(klines, bias = null) {
   const closedKlines = klines.slice(0, -1);
   const closes = closedKlines.map((k) => k.close);
   const liveCandle = klines.at(-1);
@@ -522,113 +535,137 @@ function analyzeDayTradingChart(klines) {
 
   const avgVol = sum(closedKlines.slice(-21, -1).map((k) => k.volume)) / 20;
   const volRatio = Math.max(c0.volume, liveCandle.volume) / (avgVol || 1);
-  const isBullCandle = c0.close > c0.open, isBearCandle = c0.close < c0.open;
+  const isBull = c0.close > c0.open, isBear = c0.close < c0.open;
+  const bodyRatio = Math.abs(c0.close - c0.open) / (c0.high - c0.low || 1e-9);
+  const adxOk = adx >= CONFIG.ADX_MIN;
 
-  // ستاپ ۱: پولبک در روند به EMA21 / VWAP / OB
-  const bullTrendPullback =
-    (c0.close > ema50 || supertrend.direction === "LONG") &&
-    (c0.low <= ema21 + atr * 0.35 || c0.low <= vwap + atr * 0.30 || orderBlock.inBullishOB) &&
-    c0.close >= ema21 && isBullCandle && macd.histogram >= macd.prevHistogram;
-  const bearTrendPullback =
-    (c0.close < ema50 || supertrend.direction === "SHORT") &&
-    (c0.high >= ema21 - atr * 0.35 || c0.high >= vwap - atr * 0.30 || orderBlock.inBearishOB) &&
-    c0.close <= ema21 && isBearCandle && macd.histogram <= macd.prevHistogram;
+  const setups = {
+    LONG: [
+      {
+        type: "🎯 پولبک به EMA21 / VWAP / OB در روند صعودی ۴H",
+        ok: ema21 > ema50 &&
+          (c0.low <= ema21 + atr * 0.25 || c0.low <= vwap + atr * 0.20 || orderBlock.inBullishOB) &&
+          c0.close > ema21 && isBull && bodyRatio >= 0.4 &&
+          rsi >= 40 && rsi <= 62 && macd.histogram >= macd.prevHistogram
+      },
+      {
+        type: divergence.bullish ? `📐 ${divergence.bullType} + Sweep کف روز قبل` : "🏛️ Sweep کف روز قبل و بازگشت (PDL Reclaim)",
+        ok: c0.low <= pdl + atr * 0.20 && c0.close > pdl && isBull && bodyRatio >= 0.4 && rsi > prevRsi
+      },
+      {
+        type: "🚀 شکست تاییدشده سقف روز قبل با حجم (PDH Breakout)",
+        ok: c1.close <= pdh && c0.close > pdh && volRatio >= 1.3 && adxOk && bodyRatio >= 0.5
+      },
+      {
+        type: "🌊 شروع موج صعودی ۱H هم‌جهت با ۴H",
+        ok: (supertrend.justFlipped && supertrend.direction === "LONG" && adxOk) ||
+          (supertrend.direction === "LONG" && macd.histogram > 0 && macd.prevHistogram <= 0 && c0.close > ema21 && adx >= 22)
+      }
+    ],
+    SHORT: [
+      {
+        type: "🎯 پولبک نزولی به EMA21 / VWAP / OB در روند نزولی ۴H",
+        ok: ema21 < ema50 &&
+          (c0.high >= ema21 - atr * 0.25 || c0.high >= vwap - atr * 0.20 || orderBlock.inBearishOB) &&
+          c0.close < ema21 && isBear && bodyRatio >= 0.4 &&
+          rsi >= 38 && rsi <= 60 && macd.histogram <= macd.prevHistogram
+      },
+      {
+        type: divergence.bearish ? `📐 ${divergence.bearType} + Sweep سقف روز قبل` : "🏛️ Sweep سقف روز قبل و ریجکت (PDH Reject)",
+        ok: c0.high >= pdh - atr * 0.20 && c0.close < pdh && isBear && bodyRatio >= 0.4 && rsi < prevRsi
+      },
+      {
+        type: "🔻 شکست تاییدشده کف روز قبل با حجم (PDL Breakdown)",
+        ok: c1.close >= pdl && c0.close < pdl && volRatio >= 1.3 && adxOk && bodyRatio >= 0.5
+      },
+      {
+        type: "🌊 شروع موج نزولی ۱H هم‌جهت با ۴H",
+        ok: (supertrend.justFlipped && supertrend.direction === "SHORT" && adxOk) ||
+          (supertrend.direction === "SHORT" && macd.histogram < 0 && macd.prevHistogram >= 0 && c0.close < ema21 && adx >= 22)
+      }
+    ]
+  };
 
-  // ستاپ ۲: واکنش به PDH/PDL (Sweep / Breakout) یا واگرایی
-  const bullPdlSweepOrBreak =
-    ((c0.low <= pdl + atr * 0.20 && c0.close > pdl) || (c1.close <= pdh && c0.close > pdh && volRatio >= 1.15) || divergence.bullish) &&
-    isBullCandle && rsi > prevRsi;
-  const bearPdhSweepOrBreak =
-    ((c0.high >= pdh - atr * 0.20 && c0.close < pdh) || (c1.close >= pdl && c0.close < pdl && volRatio >= 1.15) || divergence.bearish) &&
-    isBearCandle && rsi < prevRsi;
+  const found = bias ? setups[bias].find((x) => x.ok) : null;
+  const hasDaySetup = Boolean(found);
+  const setupDirection = bias ?? supertrend.direction;
+  const setupType = found
+    ? found.type
+    : bias ? "در انتظار ستاپ ۱ ساعته هم‌جهت با روند ۴H" : "روند ۴ ساعته نامشخص (بدون معامله)";
 
-  // ستاپ ۳: شروع موج با Supertrend / MACD
-  const bullWaveStart =
-    (supertrend.justFlipped && supertrend.direction === "LONG") ||
-    (supertrend.direction === "LONG" && c0.close > ema21 && macd.histogram > 0 && macd.prevHistogram <= 0);
-  const bearWaveStart =
-    (supertrend.justFlipped && supertrend.direction === "SHORT") ||
-    (supertrend.direction === "SHORT" && c0.close < ema21 && macd.histogram < 0 && macd.prevHistogram >= 0);
-
-  let hasDaySetup = true;
-  let setupType, setupDirection;
-  if (bullTrendPullback) { setupType = "🎯 پولبک روزانه به EMA21 / VWAP / OB"; setupDirection = "LONG"; }
-  else if (bearTrendPullback) { setupType = "🎯 پولبک نزولی به مقاومت EMA21 / VWAP / OB"; setupDirection = "SHORT"; }
-  else if (bullPdlSweepOrBreak) {
-    setupType = divergence.bullish ? `📐 ${divergence.bullType} در حمایت روزانه` : "🏛️ واکنش به سطح کلیدی روز قبل (PDL/PDH)";
-    setupDirection = "LONG";
-  } else if (bearPdhSweepOrBreak) {
-    setupType = divergence.bearish ? `📐 ${divergence.bearType} در مقاومت روزانه` : "🏛️ ریجکت از سقف کلیدی روز قبل (PDH)";
-    setupDirection = "SHORT";
-  } else if (bullWaveStart) { setupType = "🌊 شروع موج جدید صعودی (1H Supertrend / MACD)"; setupDirection = "LONG"; }
-  else if (bearWaveStart) { setupType = "🌊 شروع موج جدید نزولی (1H Supertrend / MACD)"; setupDirection = "SHORT"; }
-  else {
-    hasDaySetup = false;
-    setupType = "در انتظار تشکیل ستاپ ۱ ساعته";
-    setupDirection = supertrend.direction;
-  }
-
-  const isChop = adx < 17;
   const distFromEma21Atr = Math.abs(liveCandle.close - ema21) / (atr || 1);
+  const atrPct = (atr / liveCandle.close) * 100;
+  const isChop = !adxOk;
+  const isLowVol = atrPct < CONFIG.MIN_ATR_PCT;
+  const isStale = Math.abs(liveCandle.close - c0.close) > atr * CONFIG.MAX_STALE_ATR;
   const isOverextended =
-    distFromEma21Atr > 1.85 ||
-    (setupDirection === "LONG" && rsi > 69) ||
-    (setupDirection === "SHORT" && rsi < 31);
+    distFromEma21Atr > 1.5 ||
+    (setupDirection === "LONG" && rsi > 66) ||
+    (setupDirection === "SHORT" && rsi < 34);
 
   return {
     close: liveCandle.close,
     ema21, ema50, ema200, vwap, pdh, pdl, swingLow, swingHigh,
-    rsi, macd, atr, adx, supertrend, orderBlock, divergence,
-    volRatio, isChop, distFromEma21Atr, isOverextended,
-    hasDaySetup, setupType, setupDirection
+    rsi, macd, atr, atrPct, adx, supertrend, orderBlock, divergence,
+    volRatio, bodyRatio, isChop, isLowVol, isStale, distFromEma21Atr, isOverextended,
+    hasDaySetup, setupType, setupDirection, trendBias: bias
   };
 }
 
 function evaluateDayTradeScore({ symbol, direction, tf1h, tf4h, macro, futuresData, news }) {
+  const isLong = direction === "LONG";
   let score = 0;
   const reasons = [];
+  const add = (pts, reason) => { score += pts; if (reason) reasons.push(reason); };
 
-  const h4Aligned =
-    (direction === "LONG" && (tf4h.supertrend.direction === "LONG" || tf4h.close >= tf4h.ema21)) ||
-    (direction === "SHORT" && (tf4h.supertrend.direction === "SHORT" || tf4h.close <= tf4h.ema21));
-  if (h4Aligned) { score += 20; reasons.push("• هم‌جهتی روند ۱ ساعته با ساختار ۴ ساعته (4H) ✅"); }
-  else score += 10;
+  // ۱. هم‌جهتی روند (۲۵) — فقط در صورت تأیید واقعی امتیاز می‌گیرد
+  if (tf4h.trend === direction) add(15, "• روند ۴ ساعته (Supertrend + EMA50) هم‌جهت است ✅");
+  const stackFull = isLong
+    ? tf1h.ema21 > tf1h.ema50 && tf1h.ema50 > tf1h.ema200
+    : tf1h.ema21 < tf1h.ema50 && tf1h.ema50 < tf1h.ema200;
+  const stackHalf = isLong ? tf1h.ema21 > tf1h.ema50 : tf1h.ema21 < tf1h.ema50;
+  if (stackFull) add(10, "• چینش کامل EMA 21/50/200 در ۱ ساعته 📚");
+  else if (stackHalf) add(5);
 
-  if (tf1h.hasDaySetup) { score += 20; reasons.push(`• ${tf1h.setupType}`); }
-  else score += 8;
+  // ۲. کیفیت ستاپ (۲۰)
+  if (tf1h.hasDaySetup) {
+    add(12, `• ${tf1h.setupType}`);
+    if (tf1h.volRatio >= 1.2) add(4, `• حجم بالاتر از میانگین (${tf1h.volRatio.toFixed(1)}x) 📈`);
+    if (isLong ? tf1h.divergence.bullish : tf1h.divergence.bearish) add(4, "• هم‌پوشانی با واگرایی RSI 📐");
+  }
 
+  // ۳. قطب‌نمای کلان (۲۰)
   const macroBull = macro.total2Trend === "BULLISH" || macro.btcTrend1h === "LONG";
   const macroBear = macro.total2Trend === "BEARISH" || macro.btcTrend1h === "SHORT";
   const macroConflict =
     symbol !== "BTCUSDT" &&
-    ((direction === "LONG" && macro.total2Trend === "BEARISH" && macro.btcTrend1h === "SHORT") ||
-     (direction === "SHORT" && macro.total2Trend === "BULLISH" && macro.btcTrend1h === "LONG"));
-  if ((direction === "LONG" && macroBull) || (direction === "SHORT" && macroBear)) {
-    score += 20;
-    reasons.push(`• تایید قطب‌نمای کلان (TOTAL2: ${macro.total2Change4h}% | USDT.D: ${macro.usdtD}%) 🌐`);
-  } else if (!macroConflict) score += 12;
-  else score += 3;
+    ((isLong && macro.total2Trend === "BEARISH" && macro.btcTrend1h === "SHORT") ||
+     (!isLong && macro.total2Trend === "BULLISH" && macro.btcTrend1h === "LONG"));
+  const macroAligned = isLong ? macroBull && !macroBear : macroBear && !macroBull;
+  const macroAgainst = isLong ? macroBear && !macroBull : macroBull && !macroBear;
+  if (macroAligned) add(20, `• تایید قطب‌نمای کلان (TOTAL2: ${macro.total2Change4h}% | USDT.D: ${macro.usdtD}%) 🌐`);
+  else if (!macroAgainst) add(8);
 
-  const vwapOrObOk =
-    (direction === "LONG" && (tf1h.close >= tf1h.vwap || tf1h.orderBlock.inBullishOB)) ||
-    (direction === "SHORT" && (tf1h.close <= tf1h.vwap || tf1h.orderBlock.inBearishOB));
-  if (vwapOrObOk) { score += 15; reasons.push("• حمایت توسط VWAP روزانه و ناحیه Order Block 🏛️"); }
-  else score += 8;
+  // ۴. موقعیت قیمت (۱۵)
+  const vwapSide = isLong ? tf1h.close >= tf1h.vwap : tf1h.close <= tf1h.vwap;
+  const inOB = isLong ? tf1h.orderBlock.inBullishOB : tf1h.orderBlock.inBearishOB;
+  if (vwapSide) add(8, "• قیمت در سمت درست VWAP سشن 🏛️");
+  if (inOB) add(7, "• واکنش از ناحیه Order Block 🧱");
 
-  if (futuresData.flowBias === direction || tf1h.adx >= 22) {
-    score += 15;
-    reasons.push(`• تایید سفارشات فیوچرز (Taker Buy: ${futuresData.takerBuyRatio}% | ADX: ${tf1h.adx.toFixed(0)}) 📊`);
-  } else score += 9;
+  // ۵. جریان سفارشات و قدرت روند (۱۰)
+  if (futuresData.flowBias === direction) add(5, `• جریان فیوچرز هم‌جهت (Taker Buy: ${futuresData.takerBuyRatio}%) 📊`);
+  if (tf1h.adx >= 25) add(5, `• روند قوی (ADX: ${tf1h.adx.toFixed(0)}) 💪`);
+  else if (tf1h.adx >= CONFIG.ADX_MIN) add(3);
 
-  if (news.bias === direction) { score += 10; reasons.push(`• حمایت سنتیمنت اخبار روز (${news.label}) 📰`); }
-  else if (news.bias === "NEUTRAL" && !tf1h.isOverextended) { score += 8; reasons.push(`• مومنتوم استاندارد روزانه (RSI: ${tf1h.rsi.toFixed(0)}) ⚡`); }
-  else score += 4;
+  // ۶. اخبار (۱۰)
+  if (news.bias === direction) add(10, `• حمایت سنتیمنت اخبار (${news.label}) 📰`);
+  else if (news.bias === "NEUTRAL") add(5);
 
   if (tf1h.isChop) score -= 10;
   if (tf1h.isOverextended) score -= 15;
 
   let grade = "در انتظار تایید ⏳";
-  if (score >= 86) grade = "Day-Trade VIP A+ 💎";
+  if (score >= 85) grade = "Day-Trade VIP A+ 💎";
   else if (score >= CONFIG.MIN_SCORE) grade = "Day-Trade Grade A 🔥";
 
   return { score: clamp(score, 0, 100), grade, reasons, macroConflict };
@@ -645,12 +682,12 @@ function calculateDayTradeTargets(tf1h, direction) {
   const structuralSL = isLong
     ? Math.min(tf1h.swingLow, ob ? ob.bottom : tf1h.swingLow) - atr * 0.40
     : Math.max(tf1h.swingHigh, ob ? ob.top : tf1h.swingHigh) + atr * 0.40;
-  const riskDist = clamp(Math.abs(price - structuralSL), atr * 1.45, atr * 2.50);
+  const riskDist = clamp(Math.abs(price - structuralSL), atr * CONFIG.SL_ATR_MIN, atr * CONFIG.SL_ATR_MAX);
 
   const sl = round(price - m * riskDist);
-  const tp1 = round(price + m * riskDist * 0.90);
-  const tp2 = round(price + m * riskDist * 1.85);
-  const tp3 = round(price + m * riskDist * 3.00);
+  const tp1 = round(price + m * riskDist * CONFIG.TP_R[0]);
+  const tp2 = round(price + m * riskDist * CONFIG.TP_R[1]);
+  const tp3 = round(price + m * riskDist * CONFIG.TP_R[2]);
 
   const zoneEdge = price - m * atr * 0.25;
   const entryZone = `${Math.min(zoneEdge, price).toFixed(dec)} ~ ${Math.max(zoneEdge, price).toFixed(dec)}`;
@@ -675,16 +712,17 @@ async function analyzeSymbol(env, symbol, macro) {
   ]);
   if (k1h.length < CONFIG.MIN_CANDLES_1H || k4h.length < CONFIG.MIN_CANDLES_4H) return { symbol, error: true };
 
-  const tf1h = analyzeDayTradingChart(k1h);
   const tf4h = analyzeTrend(k4h);
+  const tf1h = analyzeDayTradingChart(k1h, tf4h.trend);
   const direction = tf1h.setupDirection;
   const scoreData = evaluateDayTradeScore({ symbol, direction, tf1h, tf4h, macro, futuresData, news });
   return { symbol, direction, entry: tf1h.close, tf1h, tf4h, macro, futuresData, news, scoreData };
 }
 
-const isSignalWorthy = (c) =>
-  !c.tf1h.isChop && !c.tf1h.isOverextended && !c.scoreData.macroConflict &&
-  c.tf1h.hasDaySetup && c.scoreData.score >= CONFIG.MIN_SCORE;
+const isSignalWorthy = (c, minScore = CONFIG.MIN_SCORE) =>
+  c.tf1h.hasDaySetup && c.tf4h.trend === c.direction &&
+  !c.tf1h.isChop && !c.tf1h.isLowVol && !c.tf1h.isStale && !c.tf1h.isOverextended &&
+  !c.scoreData.macroConflict && c.scoreData.score >= minScore;
 
 /* =========================================================
    ۶. مدیریت پوزیشن (ذخیره‌سازی، ارزیابی، نهایی‌سازی)
@@ -803,6 +841,9 @@ async function finalizeTrade(env, pos, action, exitPrice) {
       signalId: pos.signalId, symbol: pos.symbol, direction: pos.direction,
       result: RESULT_LABELS[action] || action, pct: finalPct
     });
+    if (action === "SL") {
+      await env.SIGNAL_KV.put(`COOLDOWN_${pos.symbol}`, "1", { expirationTtl: CONFIG.COOLDOWN_AFTER_SL_SEC });
+    }
   } catch (e) { console.error("Stat Error:", e); }
   return finalPct;
 }
@@ -1064,7 +1105,7 @@ ${modeTag}${dirTitle} | <b>#${symbol}</b> • <code>1H / 4H</code>
 <blockquote>🌐 <b>قطب‌نمای کلان و اخبار (v${VERSION}):</b>
 • <b>USDT.D:</b> ${macro.usdtD}% | <b>TOTAL2 (4h):</b> <b>${macro.total2Change4h}%</b> | <b>اخبار:</b> ${news.label}
 • <b>سقف/کف روز قبل:</b> PDH: <code>${fp(tf1h.pdh)}</code> | PDL: <code>${fp(tf1h.pdl)}</code>
-${scoreData.reasons.slice(0, 3).join("\n")}</blockquote>
+${scoreData.reasons.slice(0, 4).join("\n")}</blockquote>
 `.trim();
 }
 
@@ -1137,8 +1178,11 @@ function buildScanBlock(c) {
   const { symbol, direction, tf1h, scoreData, news } = c;
   const dirIcon = direction === "LONG" ? "🟢 LONG" : "🔴 SHORT";
   let state = tf1h.hasDaySetup ? `🔥 <b>${tf1h.setupType}</b>` : "⏳ در انتظار پولبک به EMA21 / سطح روزانه";
+  if (!tf1h.trendBias) state = "⏳ روند ۴ ساعته نامشخص؛ بدون معامله";
   if (tf1h.isChop) state = "⚠️ بازار بدون روند (ADX پایین)";
+  else if (tf1h.isLowVol) state = "💤 نوسان خیلی کم؛ تارگت‌ها به کارمزد می‌خورند";
   else if (tf1h.isOverextended) state = "🚫 اشباع کندل ۱ ساعته (صبر برای اصلاح)";
+  else if (tf1h.isStale) state = "⌛ قیمت از کندل ستاپ فاصله گرفته (ورود دیرهنگام)";
   return (
     `🪙 <b>#${symbol}</b> • <code>${tf1h.close}</code>\n` +
     `├ <b>جهت (1H/4H):</b> ${dirIcon} | <b>امتیاز: ${scoreData.score}/100</b>\n` +
